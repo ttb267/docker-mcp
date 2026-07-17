@@ -1,5 +1,5 @@
 # Build stage
-FROM --platform=${BUILDPLATFORM:-linux/amd64} golang:1.24-alpine AS builder
+FROM --platform=${BUILDPLATFORM:-linux/amd64} golang:1.25-alpine3.19 AS builder
 
 # Install build dependencies
 RUN apk add --no-cache git make
