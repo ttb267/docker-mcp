@@ -34,6 +34,32 @@ make build
 
 ## 部署指南
 
+### 构建 Docker 镜像
+
+```bash
+# 克隆仓库
+git clone https://github.com/ttb267/docker-mcp.git
+cd docker-mcp
+
+# 构建本地镜像
+make build-image
+
+# 或直接使用 docker
+docker build -t docker-mcp:latest .
+```
+
+**其他构建选项：**
+
+```bash
+# 构建特定平台镜像
+make build-imagex86    # x86_64
+make build-imagearm64  # ARM64
+
+# 构建并推送到镜像仓库
+# 先修改 Makefile 中的 REGISTRY 为你的镜像仓库地址
+make push
+```
+
 ### Docker Compose 部署
 
 #### 方式一：无鉴权（开发环境）
@@ -99,6 +125,43 @@ kubectl create secret generic docker-mcp-basic-auth \
 kubectl apply -f deploy/k8s.yaml
 ```
 
+## 鉴权配置
+
+### 方式一：Authorization Header 鉴权（API Key）
+
+MCP Server 支持通过 `Authorization` Header 进行 API Key 鉴权：
+
+```bash
+# 启动服务时设置 API Key
+docker run -d -p 8080:8080 \
+  -e MCP_API_KEY=your-secret-api-key \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  docker-mcp:latest
+
+# 客户端请求时需要在 Header 中添加
+curl -H "Authorization: Bearer your-secret-api-key" \
+  http://localhost:8080/mcp
+```
+
+**客户端配置（Claude Desktop）：**
+
+```json
+{
+  "mcpServers": {
+    "docker-mcp": {
+      "url": "http://localhost:8080/mcp",
+      "headers": {
+        "Authorization": "Bearer your-secret-api-key"
+      }
+    }
+  }
+}
+```
+
+### 方式二：Nginx Basic Auth 鉴权
+
+详见上方 Docker Compose 部署部分。
+
 ## 配置说明
 
 ### 环境变量
@@ -106,6 +169,8 @@ kubectl apply -f deploy/k8s.yaml
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
 | `DOCKER_HOST` | Docker 守护进程地址 | `unix:///var/run/docker.sock` |
+| `MCP_API_KEY` | API Key 鉴权密钥 | 无（不启用） |
+| `MCP_PORT` | HTTP 服务端口 | `8080` |
 
 ### 部署模式
 
@@ -145,12 +210,15 @@ environment:
 }
 ```
 
-有鉴权（需要配置 API Key）：
+有鉴权（Authorization Header）：
 ```json
 {
   "mcpServers": {
     "docker-mcp": {
-      "url": "http://localhost:8090/mcp"
+      "url": "http://localhost:8080/mcp",
+      "headers": {
+        "Authorization": "Bearer your-secret-api-key"
+      }
     }
   }
 }
@@ -162,8 +230,11 @@ environment:
 # 获取服务能力
 GET http://localhost:8080/mcp
 
-# 调用工具
-POST http://localhost:8080/mcp
+# 调用工具（需要带 Authorization Header）
+curl -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-secret-api-key" \
+  -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'
 ```
 
 ## 工具使用示例

@@ -6,12 +6,39 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
+	"sync"
 
 	"github.com/docker-mcp/docker-mcp/internal/docker"
 	"github.com/docker-mcp/docker-mcp/pkg/compose"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
+
+// API Key for Authorization header authentication
+var (
+	apiKey     string
+	apiKeyOnce sync.Once
+	apiKeySet  bool
+)
+
+// SetAPIKey sets the API key for authentication
+func SetAPIKey(key string) {
+	apiKeyOnce.Do(func() {
+		apiKey = key
+		apiKeySet = true
+	})
+}
+
+// GetAPIKey returns the current API key
+func GetAPIKey() string {
+	return apiKey
+}
+
+// IsAuthEnabled returns whether authentication is enabled
+func IsAuthEnabled() bool {
+	return apiKeySet && apiKey != ""
+}
 
 type Server struct {
 	dockerClient *docker.DockerClient
@@ -307,14 +334,30 @@ type JSONError struct {
 }
 
 func (s *Server) RunHTTP(port string) error {
-	// Health check endpoint
+	// Health check endpoint (no auth required)
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
 	})
 
-	// MCP endpoint
+	// MCP endpoint with authentication
 	http.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+		// Check authentication if enabled
+		if IsAuthEnabled() {
+			authHeader := r.Header.Get("Authorization")
+			if authHeader == "" {
+				http.Error(w, "Authorization header required", http.StatusUnauthorized)
+				return
+			}
+
+			// Support "Bearer <api-key>" format
+			token := strings.TrimPrefix(authHeader, "Bearer ")
+			if token != apiKey {
+				http.Error(w, "Invalid API key", http.StatusUnauthorized)
+				return
+			}
+		}
+
 		if r.Method == http.MethodGet {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{

@@ -11,7 +11,13 @@ import (
 func main() {
 	port := flag.String("port", "8080", "HTTP server port (for HTTP mode)")
 	mode := flag.String("mode", "stdio", "Server mode: stdio or http")
+	apiKey := flag.String("api-key", os.Getenv("MCP_API_KEY"), "API Key for Authorization header authentication")
 	flag.Parse()
+
+	// Pass API key to server if provided
+	if *apiKey != "" {
+		mcp.SetAPIKey(*apiKey)
+	}
 
 	server, err := mcp.NewServer()
 	if err != nil {
@@ -24,6 +30,9 @@ func main() {
 	case "http":
 		// HTTP mode: stdout logging is fine
 		fmt.Printf("Docker MCP Server starting in HTTP mode on port %s...\n", *port)
+		if *apiKey != "" {
+			fmt.Printf("API Key authentication enabled\n")
+		}
 		if err := server.RunHTTP(*port); err != nil {
 			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 			os.Exit(1)
