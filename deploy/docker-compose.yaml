@@ -1,0 +1,78 @@
+version: '3.8'
+
+services:
+  # ============================================================
+  # 方案一：Docker-outside-of-Docker (DooD) - socket 挂载模式
+  # ============================================================
+  # MCP 直接通过 Unix socket 访问宿主机 Docker 守护进程
+  # 优点：简单直接，无需额外组件
+  # 缺点：需要挂载宿主机的 docker.sock
+  # ============================================================
+  docker-mcp-dood:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: docker-mcp:latest
+    container_name: docker-mcp-dood
+    restart: unless-stopped
+    # 挂载 Docker socket
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    # HTTP 模式需要暴露端口
+    ports:
+      - "8080:8080"
+    # 使用 HTTP 模式
+    command: ["--mode", "http", "--port", "8080"]
+    environment:
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.5'
+    networks:
+      - docker-mcp-network
+
+  # ============================================================
+  # 方案二：Docker API 代理模式
+  # ============================================================
+  # MCP 通过 HTTP 调用 Docker API 代理服务
+  # 优点：松耦合，支持远程 Docker 守护进程
+  # 缺点：需要额外部署代理服务
+  # ============================================================
+  # docker-proxy:
+  #   image: alpine/socat
+  #   container_name: docker-proxy
+  #   restart: unless-stopped
+  #   command: ["tcp-listen:2375,fork,reuseaddr", "unix-connect:/var/run/docker.sock"]
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #   networks:
+  #     - docker-mcp-network
+  #
+  # docker-mcp-proxy:
+  #   build:
+  #     context: ..
+  #     dockerfile: Dockerfile
+  #   image: docker-mcp:latest
+  #   container_name: docker-mcp-proxy
+  #   restart: unless-stopped
+  #   depends_on:
+  #     - docker-proxy
+  #   ports:
+  #     - "8080:8080"
+  #   command: ["--mode", "http", "--port", "8080"]
+  #   environment:
+  #     # 通过 HTTP 连接 Docker API 代理
+  #     - DOCKER_HOST=tcp://docker-proxy:2375
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         memory: 256M
+  #         cpus: '0.5'
+  #   networks:
+  #     - docker-mcp-network
+
+networks:
+  docker-mcp-network:
+    driver: bridge

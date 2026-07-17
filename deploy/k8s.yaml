@@ -1,0 +1,157 @@
+# Kubernetes deployment for Docker MCP
+# ============================================================
+# 方案一：Docker-outside-of-Docker (DooD) - socket 挂载模式
+# ============================================================
+# MCP 直接通过 Unix socket 访问宿主机 Docker 守护进程
+# 优点：简单直接，无需额外组件
+# 缺点：需要节点有 /var/run/docker.sock
+# ============================================================
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: docker-mcp
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: docker-mcp-config
+  namespace: docker-mcp
+data:
+  # 方案一：Unix socket 模式
+  DOCKER_HOST: "unix:///var/run/docker.sock"
+  # 方案二：TCP 代理模式（需要额外部署 docker-proxy）
+  # DOCKER_HOST: "tcp://docker-proxy:2375"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: docker-mcp
+  namespace: docker-mcp
+  labels:
+    app: docker-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: docker-mcp
+  template:
+    metadata:
+      labels:
+        app: docker-mcp
+    spec:
+      tolerations:
+        - key: "node.kubernetes.io/not-ready"
+          operator: "Exists"
+          effect: "NoSchedule"
+      containers:
+        - name: docker-mcp
+          image: docker-mcp:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: DOCKER_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: docker-mcp-config
+                  key: DOCKER_HOST
+          # 方案一：挂载 Docker socket（取消注释启用）
+          volumeMounts:
+            - name: docker-socket
+              mountPath: /var/run/docker.sock
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "250m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: docker-socket
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: docker-mcp
+  namespace: docker-mcp
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  selector:
+    app: docker-mcp
+
+# ============================================================
+# 方案二：Docker API 代理模式（需要取消注释启用）
+# ============================================================
+# 部署步骤：
+# 1. 取消注释下面的 docker-proxy Deployment
+# 2. 修改 ConfigMap 中的 DOCKER_HOST 为 tcp://docker-proxy:2375
+# 3. 删除 socket 相关的 volumeMounts
+# ============================================================
+
+# ---
+# apiVersion: apps/v1
+# kind: Deployment
+# metadata:
+#   name: docker-proxy
+#   namespace: docker-mcp
+# spec:
+#   replicas: 1
+#   selector:
+#     matchLabels:
+#       app: docker-proxy
+#   template:
+#     metadata:
+#       labels:
+#         app: docker-proxy
+#     spec:
+#       tolerations:
+#         - key: "node.kubernetes.io/not-ready"
+#           operator: "Exists"
+#           effect: "NoSchedule"
+#       containers:
+#         - name: docker-proxy
+#           image: alpine/socat
+#           args: ["tcp-listen:2375,fork,reuseaddr", "unix-connect:/var/run/docker.sock"]
+#           volumeMounts:
+#             - name: docker-socket
+#               mountPath: /var/run/docker.sock
+#       volumes:
+#         - name: docker-socket
+#           hostPath:
+#             path: /var/run/docker.sock
+#             type: Socket
+# ---
+# apiVersion: v1
+# kind: Service
+# metadata:
+#   name: docker-proxy
+#   namespace: docker-mcp
+# spec:
+#   type: ClusterIP
+#   ports:
+#     - port: 2375
+#       targetPort: 2375
+#       protocol: TCP
+#       name: docker-api
+#   selector:
+#     app: docker-proxy
