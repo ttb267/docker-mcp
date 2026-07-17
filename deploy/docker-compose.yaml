@@ -1,19 +1,12 @@
 version: '3.8'
 
 services:
-  # ============================================================
-  # 方案一：Docker-outside-of-Docker (DooD) - socket 挂载模式（无鉴权）
-  # ============================================================
-  # MCP 直接通过 Unix socket 访问宿主机 Docker 守护进程
-  # 优点：简单直接，无需额外组件
-  # 缺点：需要挂载宿主机的 docker.sock，无鉴权保护
-  # ============================================================
-  docker-mcp-dood:
+  docker-mcp:
     build:
       context: ..
       dockerfile: Dockerfile
     image: docker-mcp:latest
-    container_name: docker-mcp-dood
+    container_name: docker-mcp
     restart: unless-stopped
     # 挂载 Docker socket
     volumes:
@@ -21,10 +14,12 @@ services:
     # HTTP 模式需要暴露端口
     ports:
       - "8080:8080"
-    # 使用 HTTP 模式
+    # 使用 HTTP 模式，支持环境变量配置 API Key
     command: ["--mode", "http", "--port", "8080"]
     environment:
       - DOCKER_HOST=unix:///var/run/docker.sock
+      # API Key 鉴权（可选，不设置则不启用鉴权）
+      # - MCP_API_KEY=your-secret-api-key
     deploy:
       resources:
         limits:
@@ -32,48 +27,6 @@ services:
           cpus: '0.5'
     networks:
       - docker-mcp-network
-
-  # ============================================================
-  # 方案二：Docker-outside-of-Docker (DooD) + Nginx 鉴权
-  # ============================================================
-  # 通过 Nginx 反向代理 + Basic Auth 保护 MCP 服务
-  # 优点：安全、可复用部署
-  # 缺点：需要额外配置 htpasswd 文件
-  #
-  # 使用方法：
-  # 1. 生成 htpasswd 文件：htpasswd -bc nginx/htpasswd username password
-  # 2. 启动服务：docker-compose -f docker-compose.yaml -f docker-compose.auth.yaml up -d
-  # ============================================================
-  # docker-mcp-with-auth:
-  #   build:
-  #     context: ..
-  #     dockerfile: Dockerfile
-  #   image: docker-mcp:latest
-  #   container_name: docker-mcp-with-auth
-  #   restart: unless-stopped
-  #   volumes:
-  #     - /var/run/docker.sock:/var/run/docker.sock
-  #   expose:
-  #     - "8080"
-  #   command: ["--mode", "http", "--port", "8080"]
-  #   environment:
-  #     - DOCKER_HOST=unix:///var/run/docker.sock
-  #   networks:
-  #     - docker-mcp-network
-  #
-  # nginx:
-  #   image: nginx:latest
-  #   container_name: docker-mcp-nginx
-  #   restart: unless-stopped
-  #   ports:
-  #     - "8090:8080"
-  #   volumes:
-  #     - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-  #     - ./htpasswd:/etc/nginx/.htpasswd:ro
-  #   depends_on:
-  #     - docker-mcp-with-auth
-  #   networks:
-  #     - docker-mcp-network
 
 networks:
   docker-mcp-network:
