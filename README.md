@@ -1,6 +1,6 @@
 # Docker MCP Server
 
-基于 Model Context Protocol (MCP) 的 Docker 管理工具，允许 AI Agent 通过 MCP 协议管理 Docker 容器和服务。
+Docker management tool based on Model Context Protocol (MCP), enabling AI agents to manage Docker containers and services through the MCP protocol.
 
 ## 功能特性
 
