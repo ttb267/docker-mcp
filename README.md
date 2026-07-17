@@ -32,17 +32,70 @@ make build
 ./bin/docker-mcp --mode http --port 8080
 ```
 
-### Docker 部署
+## 部署指南
+
+### Docker Compose 部署
+
+#### 方式一：无鉴权（开发环境）
 
 ```bash
-# 使用 Docker Compose
 cd deploy
 docker-compose up -d
+# 访问 http://localhost:8080
+```
+
+#### 方式二：Nginx Basic Auth 鉴权（生产环境推荐）
+
+```bash
+cd deploy
+
+# 1. 安装 htpasswd 工具 (如果不存在)
+# Ubuntu/Debian:
+sudo apt install apache2-utils
+# CentOS/RHEL:
+sudo yum install httpd-tools
+
+# 2. 生成 htpasswd 文件
+htpasswd -bc htpasswd admin yourpassword
+
+# 3. 启动服务（需要先创建网络）
+docker network create docker-mcp-network
+docker-compose -f docker-compose.yaml -f docker-compose.auth.yaml up -d
+
+# 4. 访问 http://localhost:8090
+#    输入用户名: admin
+#    输入密码: yourpassword
+```
+
+**htpasswd 其他用法：**
+```bash
+# 追加新用户
+htpasswd -b htpasswd username password
+
+# 验证用户
+htpasswd -v htpasswd username
 ```
 
 ### Kubernetes 部署
 
+#### 方式一：基础部署（无鉴权）
+
 ```bash
+kubectl apply -f deploy/k8s.yaml
+```
+
+#### 方式二：Ingress + Basic Auth 鉴权
+
+```bash
+# 1. 生成 htpasswd 文件
+htpasswd -bc htpasswd admin yourpassword
+
+# 2. 创建 Secret
+kubectl create secret generic docker-mcp-basic-auth \
+  --from-file=auth=./htpasswd \
+  -n docker-mcp
+
+# 3. 取消 k8s.yaml 中 Ingress 鉴权部分的注释并应用
 kubectl apply -f deploy/k8s.yaml
 ```
 
@@ -80,12 +133,24 @@ environment:
 
 ### Claude Desktop
 
+无鉴权：
 ```json
 {
   "mcpServers": {
     "docker-mcp": {
       "command": "/path/to/docker-mcp",
       "args": ["--mode", "http", "--port", "8080"]
+    }
+  }
+}
+```
+
+有鉴权（需要配置 API Key）：
+```json
+{
+  "mcpServers": {
+    "docker-mcp": {
+      "url": "http://localhost:8090/mcp"
     }
   }
 }
@@ -134,7 +199,10 @@ execContainer(
 │   └── logging/             # 日志模块
 ├── pkg/compose/             # Docker Compose 支持
 ├── deploy/
-│   ├── docker-compose.yaml  # Docker Compose 部署
+│   ├── docker-compose.yaml  # Docker Compose 部署（无鉴权）
+│   ├── docker-compose.auth.yaml  # 鉴权配置
+│   ├── nginx.conf           # Nginx 配置
+│   ├── htpasswd             # 鉴权文件（需手动生成）
 │   └── k8s.yaml            # Kubernetes 部署
 ├── Dockerfile
 └── Makefile
