@@ -1,0 +1,32 @@
+# ============================================================
+# Docker MCP with Nginx Basic Auth
+# 使用方法:
+#   1. 生成 htpasswd: htpasswd -bc htpasswd admin yourpassword
+#   2. 启动: docker-compose -f docker-compose.yaml -f docker-compose.auth.yaml up -d
+# ============================================================
+
+services:
+  docker-mcp:
+    container_name: docker-mcp-auth
+    expose:
+      - "8080"
+    networks:
+      - docker-mcp-network
+
+  nginx:
+    image: nginx:latest
+    container_name: docker-mcp-nginx
+    restart: unless-stopped
+    ports:
+      - "8090:8080"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./htpasswd:/etc/nginx/.htpasswd:ro
+    depends_on:
+      - docker-mcp
+    networks:
+      - docker-mcp-network
+
+networks:
+  docker-mcp-network:
+    external: true

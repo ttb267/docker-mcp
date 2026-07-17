@@ -4,7 +4,7 @@
 # ============================================================
 # MCP 直接通过 Unix socket 访问宿主机 Docker 守护进程
 # 优点：简单直接，无需额外组件
-# 缺点：需要节点有 /var/run/docker.sock
+# 缺点：需要节点有 /var/run/docker.sock，无鉴权保护
 # ============================================================
 
 ---
@@ -98,6 +98,82 @@ spec:
       name: http
   selector:
     app: docker-mcp
+
+# ============================================================
+# 方案三：Kubernetes Ingress + Basic Auth 鉴权
+# ============================================================
+# 通过 Ingress + Annotations 实现 Basic Auth 鉴权
+# 优点：K8s 原生方案、可与现有 K8s 认证系统集成
+# 缺点：需要 Ingress Controller 支持
+#
+# 使用方法：
+# 1. 创建 secret 保存 Basic Auth 信息
+# 2. 应用 Ingress 配置
+# ============================================================
+# ---
+# apiVersion: v1
+# kind: Secret
+# metadata:
+#   name: docker-mcp-basic-auth
+#   namespace: docker-mcp
+# type: Opaque
+# stringData:
+#   # 生成方式：echo -n "admin:password" | base64
+#   # 用户名: admin
+#   # 密码: yourpassword
+#   auth: YWRtaW46JDJ5JDA1JFRSVUFJVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV
+# ---
+# apiVersion: networking.k8s.io/v1
+# kind: Ingress
+# metadata:
+#   name: docker-mcp-ingress
+#   namespace: docker-mcp
+#   annotations:
+#     # Nginx Ingress Controller 鉴权注解
+#     nginx.ingress.kubernetes.io/auth-type: basic
+#     nginx.ingress.kubernetes.io/auth-secret: docker-mcp-basic-auth
+#     nginx.ingress.kubernetes.io/auth-realm: "Docker MCP Server"
+# spec:
+#   ingressClassName: nginx
+#   rules:
+#     - host: docker-mcp.yourdomain.com
+#       http:
+#         paths:
+#           - path: /
+#             pathType: Prefix
+#             backend:
+#               service:
+#                 name: docker-mcp
+#                 port:
+#                   number: 8080
+# ---
+# # 如果需要 TLS
+# apiVersion: networking.k8s.io/v1
+# kind: Ingress
+# metadata:
+#   name: docker-mcp-ingress-tls
+#   namespace: docker-mcp
+#   annotations:
+#     nginx.ingress.kubernetes.io/auth-type: basic
+#     nginx.ingress.kubernetes.io/auth-secret: docker-mcp-basic-auth
+#     nginx.ingress.kubernetes.io/ssl-redirect: "true"
+# spec:
+#   ingressClassName: nginx
+#   tls:
+#     - hosts:
+#         - docker-mcp.yourdomain.com
+#       secretName: docker-mcp-tls-secret
+#   rules:
+#     - host: docker-mcp.yourdomain.com
+#       http:
+#         paths:
+#           - path: /
+#             pathType: Prefix
+#             backend:
+#               service:
+#                 name: docker-mcp
+#                 port:
+#                   number: 8080
 
 # ============================================================
 # 方案二：Docker API 代理模式（需要取消注释启用）
