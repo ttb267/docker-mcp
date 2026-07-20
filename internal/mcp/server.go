@@ -543,6 +543,7 @@ func (s *Server) RunHTTP(port string) error {
 	// Health check endpoint (no auth required)
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		// Health check endpoint for ELB and load balancers
+		log.Printf("[INFO] /health called from %s", r.RemoteAddr)
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
@@ -550,6 +551,7 @@ func (s *Server) RunHTTP(port string) error {
 
 	// Detailed health check endpoint
 	http.HandleFunc("/health/detailed", func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("[INFO] /health/detailed called from %s", r.RemoteAddr)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 
