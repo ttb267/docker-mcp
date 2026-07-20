@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/docker-mcp/docker-mcp/internal/docker"
 	"github.com/docker-mcp/docker-mcp/pkg/compose"
@@ -173,6 +175,15 @@ func (s *Server) handleCreateContainer(ctx context.Context, request mcp.CallTool
 	envStr := request.GetString("env", "")
 	cmdStr := request.GetString("cmd", "")
 
+	// Security check: validate cmd if provided
+	if cmdStr != "" {
+		// Join the cmd parts to check as a single string
+		cmdCheck := strings.Join(splitAndTrim(cmdStr), " ")
+		if allowed, reason := isContainerCmdAllowed(cmdCheck); !allowed {
+			return mcp.NewToolResultError(fmt.Sprintf("Security rejected: %s", reason)), nil
+		}
+	}
+
 	var ports []string
 	if portsStr != "" {
 		ports = splitAndTrim(portsStr)
@@ -185,7 +196,7 @@ func (s *Server) handleCreateContainer(ctx context.Context, request mcp.CallTool
 
 	var cmd []string
 	if cmdStr != "" {
-		cmd = splitAndTrim(cmdStr)
+		cmd = strings.Fields(cmdStr) // Split by whitespace, not comma
 	}
 
 	containerID, err := s.dockerClient.CreateContainer(ctx, docker.ContainerConfig{
@@ -323,6 +334,28 @@ var allowedCommands = []string{
 	"docker tag",
 	"docker login",
 	"docker push",
+	"ls",
+	"ll",
+	"dir",
+	"pwd",
+	"whoami",
+}
+
+// allowedContainerCommands defines allowed commands for container startup (createContainer)
+var allowedContainerCommands = []string{
+	"sleep",
+	"tail",
+	"cat",
+	"echo",
+	"ping",
+	"true",
+	"false",
+	"date",
+	"hostname",
+	"id",
+	"uname",
+	"top",
+	"htop",
 }
 
 // dangerousCommands defines commands that are not allowed
@@ -359,6 +392,37 @@ var dangerousCommands = []string{
 	"sftp",
 }
 
+// isContainerCmdAllowed checks if command is allowed for container startup (createContainer)
+func isContainerCmdAllowed(cmdStr string) (bool, string) {
+	// First check for dangerous commands
+	lowerCmd := strings.ToLower(cmdStr)
+	for _, dangerous := range dangerousCommands {
+		if strings.Contains(lowerCmd, dangerous+" ") ||
+			strings.HasPrefix(lowerCmd, dangerous) ||
+			strings.Contains(lowerCmd, " "+dangerous) ||
+			strings.Contains(lowerCmd, "|"+dangerous) ||
+			strings.Contains(lowerCmd, "&&"+dangerous) ||
+			strings.Contains(lowerCmd, "; "+dangerous) {
+			log.Printf("[SECURITY] [REJECTED] createContainer - Command blocked: '%s' in cmd: '%s' - %s",
+				dangerous, cmdStr, time.Now().Format(time.RFC3339))
+			return false, fmt.Sprintf("Command '%s' is not allowed for security reasons", dangerous)
+		}
+	}
+
+	// Check if command matches allowed patterns for container startup
+	for _, allowed := range allowedContainerCommands {
+		if strings.Contains(lowerCmd, allowed) {
+			log.Printf("[SECURITY] [ALLOWED] createContainer - Command allowed: '%s' in cmd: '%s' - %s",
+				allowed, cmdStr, time.Now().Format(time.RFC3339))
+			return true, fmt.Sprintf("%s command is allowed for container startup", allowed)
+		}
+	}
+
+	log.Printf("[SECURITY] [REJECTED] createContainer - No allowed command found in cmd: '%s' - %s",
+		cmdStr, time.Now().Format(time.RFC3339))
+	return false, "Only safe commands like sleep, tail, cat, echo, ping, etc. are allowed for container startup"
+}
+
 func isCommandAllowed(cmdStr string) (bool, string) {
 	// Check for dangerous commands
 	lowerCmd := strings.ToLower(cmdStr)
@@ -370,6 +434,8 @@ func isCommandAllowed(cmdStr string) (bool, string) {
 			strings.Contains(lowerCmd, "|"+dangerous) ||
 			strings.Contains(lowerCmd, "&&"+dangerous) ||
 			strings.Contains(lowerCmd, "; "+dangerous) {
+			log.Printf("[SECURITY] [REJECTED] execContainer - Command blocked: '%s' in cmd: '%s' - %s",
+				dangerous, cmdStr, time.Now().Format(time.RFC3339))
 			return false, fmt.Sprintf("Command '%s' is not allowed for security reasons", dangerous)
 		}
 	}
@@ -380,6 +446,8 @@ func isCommandAllowed(cmdStr string) (bool, string) {
 	for _, allowed := range allowedCommands {
 		if strings.Contains(lowerCmd, allowed) {
 			isAllowed = true
+			log.Printf("[SECURITY] [ALLOWED] execContainer - Command allowed: '%s' in cmd: '%s' - %s",
+				allowed, cmdStr, time.Now().Format(time.RFC3339))
 			switch allowed {
 			case "modelscope":
 				reason = "modelscope download command"
@@ -397,6 +465,8 @@ func isCommandAllowed(cmdStr string) (bool, string) {
 	}
 
 	if !isAllowed {
+		log.Printf("[SECURITY] [REJECTED] execContainer - No allowed command found in cmd: '%s' - %s",
+			cmdStr, time.Now().Format(time.RFC3339))
 		return false, "Only modelscope download, docker pull, docker tag, docker login, docker push commands are allowed"
 	}
 
@@ -419,8 +489,8 @@ func (s *Server) handleExecContainer(ctx context.Context, request mcp.CallToolRe
 		return mcp.NewToolResultError(fmt.Sprintf("Security rejected: %s", reason)), nil
 	}
 
-	// Split command string into slice
-	cmd := splitAndTrim(cmdStr)
+	// Split command string into slice (by whitespace, not comma)
+	cmd := strings.Fields(cmdStr)
 
 	result, err := s.dockerClient.ExecContainer(ctx, containerID, cmd)
 	if err != nil {

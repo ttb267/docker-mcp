@@ -1,10 +1,9 @@
 package docker
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"time"
+	"io"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -197,30 +196,35 @@ func (d *DockerClient) ExecContainer(ctx context.Context, containerID string, cm
 		return nil, fmt.Errorf("failed to create exec: %w", err)
 	}
 
+	// Start the exec with hijacked connection to get output
+	resp, err := d.cli.ContainerExecAttach(ctx, execID.ID, types.ExecStartCheck{
+		Tty: false,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to attach exec: %w", err)
+	}
+	defer resp.Close()
+
 	// Start the exec
 	err = d.cli.ContainerExecStart(ctx, execID.ID, types.ExecStartCheck{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to start exec: %w", err)
 	}
 
-	// Wait for exec to finish and get output
-	var output bytes.Buffer
-	for {
-		inspectResp, err := d.cli.ContainerExecInspect(ctx, execID.ID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to inspect exec: %w", err)
-		}
-
-		if !inspectResp.Running {
-			// Try to get output from the container's log if available
-			// Since we can't easily get exec output, return the exit code
-			return &ExecResult{
-				ExitCode: inspectResp.ExitCode,
-				Output:   output.String(),
-			}, nil
-		}
-
-		// Small delay to avoid busy loop
-		time.Sleep(100 * time.Millisecond)
+	// Read output from hijacked connection's Reader
+	output, err := io.ReadAll(resp.Reader)
+	if err != nil && err.Error() != "EOF" {
+		// Continue even if there's an error, we might still have output
 	}
+
+	// Get exit code
+	inspectResp, err := d.cli.ContainerExecInspect(ctx, execID.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect exec: %w", err)
+	}
+
+	return &ExecResult{
+		ExitCode: inspectResp.ExitCode,
+		Output:   string(output),
+	}, nil
 }
