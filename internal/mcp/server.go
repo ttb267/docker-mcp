@@ -339,6 +339,14 @@ var allowedCommands = []string{
 	"dir",
 	"pwd",
 	"whoami",
+	"wget",
+	"curl",
+	"tar",
+	"unzip",
+	"gunzip",
+	"bunzip2",
+	"xz",
+	"unxz",
 }
 
 // allowedContainerCommands defines allowed commands for container startup (createContainer)
@@ -382,8 +390,6 @@ var dangerousCommands = []string{
 	"bash",
 	"sh",
 	"powershell",
-	"curl",
-	"wget",
 	"nc",
 	"netcat",
 	"ssh",
