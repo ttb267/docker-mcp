@@ -6,12 +6,51 @@ Docker management tool based on Model Context Protocol (MCP), enabling AI agents
 
 | 工具 | 说明 |
 |------|------|
-| `createContainer` | 创建并启动 Docker 容器 |
+| `createContainer` | 创建并启动 Docker 容器（带安全限制） |
 | `listContainers` | 获取所有容器列表 |
+| `listImages` | 获取所有镜像列表 |
 | `getContainerLogs` | 获取容器日志 |
 | `inspectContainer` | 获取容器状态详情 |
 | `createComposeService` | 通过 docker-compose 启动服务 |
-| `execContainer` | 在运行中的容器内执行命令 |
+| `execContainer` | 在运行中的容器内执行命令（带安全限制） |
+
+## 安全机制
+
+### execContainer 命令限制
+
+为保障安全，`execContainer` 工具仅允许以下命令：
+
+**下载/解压命令：**
+- `wget`, `curl` - 文件下载
+- `tar`, `unzip`, `gunzip`, `bunzip2`, `xz`, `unxz` - 解压
+
+**Docker 操作：**
+- `docker pull`, `docker tag`, `docker login`, `docker push`
+
+**AI 模型下载：**
+- `modelscope` - ModelScope 模型下载
+
+**查看命令：**
+- `ls`, `ll`, `dir`, `pwd`, `whoami`
+
+**危险命令（被阻止）：**
+- 文件操作：`rm`, `mv`, `cp`, `echo`, `chmod`, `chown`, `touch`, `mkdir` 等
+- Shell：`bash`, `sh`, `powershell`, `python`, `python3`, `node` 等
+- 网络：`nc`, `netcat`, `ssh`, `scp`, `ftp` 等
+
+### createContainer 命令限制
+
+容器启动时仅允许以下命令：
+- `sleep`, `tail`, `cat`, `echo`, `ping`, `true`, `false`, `date`, `hostname`, `id`, `uname`
+
+### 安全日志
+
+所有安全拦截和允许的操作都会记录到控制台日志：
+
+```
+[SECURITY] [REJECTED] execContainer - Command blocked: 'rm' in cmd: 'rm -rf /'
+[SECURITY] [ALLOWED] execContainer - Command allowed: 'ls' in cmd: 'ls -la /'
+```
 
 ## 快速开始
 
@@ -228,7 +267,7 @@ execContainer(
 
 ## 技术栈
 
-- Go 1.21+
+- Go 1.25+
 - [docker/docker](https://github.com/docker/docker) - Docker API Go 客户端
 - [mark3labs/mcp-go](https://github.com/mark3labs/mcp-go) - MCP Go SDK
 
