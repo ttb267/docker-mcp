@@ -46,6 +46,12 @@ func (d *DockerClient) Close() error {
 	return d.cli.Close()
 }
 
+// Ping checks if Docker daemon is accessible
+func (d *DockerClient) Ping(ctx context.Context) error {
+	_, err := d.cli.Ping(ctx)
+	return err
+}
+
 func (d *DockerClient) CreateContainer(ctx context.Context, cfg ContainerConfig) (string, error) {
 	portBindings := make(nat.PortMap)
 	exposedPorts := make(nat.PortSet)

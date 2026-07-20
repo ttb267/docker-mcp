@@ -165,6 +165,7 @@ func (s *Server) registerTools() {
 }
 
 func (s *Server) handleCreateContainer(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	log.Printf("[INFO] handleCreateContainer called")
 	image := request.GetString("image", "")
 	if image == "" {
 		return mcp.NewToolResultError("image is required"), nil
@@ -215,6 +216,7 @@ func (s *Server) handleCreateContainer(ctx context.Context, request mcp.CallTool
 }
 
 func (s *Server) handleListContainers(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	log.Printf("[INFO] handleListContainers called")
 	containers, err := s.dockerClient.ListContainers(ctx)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to list containers: %v", err)), nil
@@ -234,6 +236,7 @@ func (s *Server) handleListContainers(ctx context.Context, request mcp.CallToolR
 }
 
 func (s *Server) handleListImages(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	log.Printf("[INFO] handleListImages called")
 	images, err := s.dockerClient.ListImages(ctx)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to list images: %v", err)), nil
@@ -258,6 +261,7 @@ func (s *Server) handleListImages(ctx context.Context, request mcp.CallToolReque
 }
 
 func (s *Server) handleGetContainerLogs(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	log.Printf("[INFO] handleGetContainerLogs called")
 	containerID := request.GetString("container_id", "")
 	if containerID == "" {
 		return mcp.NewToolResultError("container_id is required"), nil
@@ -278,6 +282,7 @@ func (s *Server) handleGetContainerLogs(ctx context.Context, request mcp.CallToo
 }
 
 func (s *Server) handleInspectContainer(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	log.Printf("[INFO] handleInspectContainer called")
 	containerID := request.GetString("container_id", "")
 	if containerID == "" {
 		return mcp.NewToolResultError("container_id is required"), nil
@@ -312,6 +317,7 @@ Created: %s
 }
 
 func (s *Server) handleCreateComposeService(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	log.Printf("[INFO] handleCreateComposeService called")
 	composeFile := request.GetString("compose_file", "")
 	if composeFile == "" {
 		return mcp.NewToolResultError("compose_file is required"), nil
@@ -480,6 +486,7 @@ func isCommandAllowed(cmdStr string) (bool, string) {
 }
 
 func (s *Server) handleExecContainer(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	log.Printf("[INFO] handleExecContainer called")
 	containerID := request.GetString("container_id", "")
 	if containerID == "" {
 		return mcp.NewToolResultError("container_id is required"), nil
@@ -535,8 +542,36 @@ type JSONError struct {
 func (s *Server) RunHTTP(port string) error {
 	// Health check endpoint (no auth required)
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		// Health check endpoint for ELB and load balancers
+		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
+	})
+
+	// Detailed health check endpoint
+	http.HandleFunc("/health/detailed", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+
+		// Check Docker connectivity
+		ctx := context.Background()
+		pingErr := s.dockerClient.Ping(ctx)
+
+		response := map[string]interface{}{
+			"status":    "healthy",
+			"docker":    "ok",
+			"timestamp": time.Now().Format(time.RFC3339),
+		}
+
+		if pingErr != nil {
+			response["status"] = "unhealthy"
+			response["docker"] = "error"
+			response["error"] = pingErr.Error()
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+
+		jsonBytes, _ := json.Marshal(response)
+		w.Write(jsonBytes)
 	})
 
 	// MCP endpoint with authentication
