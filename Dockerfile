@@ -31,7 +31,7 @@ WORKDIR /app
 COPY --from=builder /app/docker-mcp .
 
 # Add to PATH
-RUN chmod +x docker-mcp && mv docker-mcp /usr/local/bin/
+ENV PATH="/app:${PATH}"
 
 # Expose HTTP port for remote agent
 EXPOSE 8080
@@ -41,4 +41,4 @@ RUN adduser -D -u 1000 appuser
 USER appuser
 
 # Default to HTTP mode for remote access
-CMD ["--mode", "http", "--port", "8080"]
+CMD ["docker-mcp", "--mode", "http", "--port", "8080"]
