@@ -101,6 +101,13 @@ func (s *Server) registerTools() {
 	)
 
 	s.mcpServer.AddTool(
+		mcp.NewTool("listImages",
+			mcp.WithDescription("List all Docker images"),
+		),
+		s.handleListImages,
+	)
+
+	s.mcpServer.AddTool(
 		mcp.NewTool("getContainerLogs",
 			mcp.WithDescription("Get logs from a specific container"),
 			mcp.WithString("container_id",
@@ -210,6 +217,30 @@ func (s *Server) handleListContainers(ctx context.Context, request mcp.CallToolR
 	for _, c := range containers {
 		result += fmt.Sprintf("- ID: %s, Name: %v, Image: %s, Status: %s, State: %s\n",
 			c.ID[:12], c.Names, c.Image, c.Status, c.State)
+	}
+
+	return mcp.NewToolResultText(result), nil
+}
+
+func (s *Server) handleListImages(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	images, err := s.dockerClient.ListImages(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to list images: %v", err)), nil
+	}
+
+	if len(images) == 0 {
+		return mcp.NewToolResultText("No images found"), nil
+	}
+
+	result := "Images:\n"
+	for _, img := range images {
+		tags := "<none>"
+		if len(img.RepoTags) > 0 {
+			tags = fmt.Sprintf("%v", img.RepoTags)
+		}
+		sizeMB := float64(img.Size) / 1024 / 1024
+		result += fmt.Sprintf("- ID: %s, Tags: %s, Size: %.2f MB\n",
+			img.ID[:12], tags, sizeMB)
 	}
 
 	return mcp.NewToolResultText(result), nil
@@ -515,12 +546,84 @@ func (s *Server) handleJSONRPCRequest(request JSONRPCRequest) JSONRPCResponse {
 	// Handle tools/list request
 	if request.Method == "tools/list" {
 		tools := []map[string]interface{}{
-			{"name": "createContainer", "description": "Create and start a new Docker container"},
-			{"name": "listContainers", "description": "List all Docker containers"},
-			{"name": "getContainerLogs", "description": "Get logs from a specific container"},
-			{"name": "inspectContainer", "description": "Get detailed information about a container"},
-			{"name": "createComposeService", "description": "Start services using docker-compose"},
-			{"name": "execContainer", "description": "Execute a safe command in a running container. Only supports: modelscope download, docker pull/tag/login/push. Dangerous commands like rm, mv, cp, echo, chmod, curl, wget, bash, sh, python, etc. are blocked."},
+			{
+				"name":        "createContainer",
+				"description": "Create and start a new Docker container",
+				"inputSchema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"image": map[string]interface{}{"type": "string", "description": "Docker image to use for the container (e.g., nginx:latest)"},
+						"name":  map[string]interface{}{"type": "string", "description": "Name for the container"},
+						"ports": map[string]interface{}{"type": "string", "description": "Port mappings in format host:container (e.g., 8080:80)"},
+						"env":   map[string]interface{}{"type": "string", "description": "Environment variables (e.g., KEY=VALUE,KEY2=VALUE2)"},
+						"cmd":   map[string]interface{}{"type": "string", "description": "Command to run in the container"},
+					},
+					"required": []string{"image"},
+				},
+			},
+			{
+				"name":        "listContainers",
+				"description": "List all Docker containers",
+				"inputSchema": map[string]interface{}{
+					"type":       "object",
+					"properties": map[string]interface{}{},
+				},
+			},
+			{
+				"name":        "listImages",
+				"description": "List all Docker images",
+				"inputSchema": map[string]interface{}{
+					"type":       "object",
+					"properties": map[string]interface{}{},
+				},
+			},
+			{
+				"name":        "getContainerLogs",
+				"description": "Get logs from a specific container",
+				"inputSchema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"container_id": map[string]interface{}{"type": "string", "description": "Container ID or name"},
+						"tail":         map[string]interface{}{"type": "string", "description": "Number of lines to show from the end of the logs (default: 100)"},
+					},
+					"required": []string{"container_id"},
+				},
+			},
+			{
+				"name":        "inspectContainer",
+				"description": "Get detailed information about a container",
+				"inputSchema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"container_id": map[string]interface{}{"type": "string", "description": "Container ID or name"},
+					},
+					"required": []string{"container_id"},
+				},
+			},
+			{
+				"name":        "createComposeService",
+				"description": "Start services using docker-compose",
+				"inputSchema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"compose_file": map[string]interface{}{"type": "string", "description": "Path to docker-compose.yml file"},
+						"project_name": map[string]interface{}{"type": "string", "description": "Project name for docker-compose"},
+					},
+					"required": []string{"compose_file"},
+				},
+			},
+			{
+				"name":        "execContainer",
+				"description": "Execute a safe command in a running container. Only supports: modelscope download, docker pull/tag/login/push. Dangerous commands like rm, mv, cp, echo, chmod, curl, wget, bash, sh, python, etc. are blocked.",
+				"inputSchema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"container_id": map[string]interface{}{"type": "string", "description": "Container ID or name"},
+						"cmd":          map[string]interface{}{"type": "string", "description": "Command to execute. Only modelscope and docker pull/tag/login/push are allowed"},
+					},
+					"required": []string{"container_id", "cmd"},
+				},
+			},
 		}
 		return JSONRPCResponse{
 			JSONRPC: "2.0",
@@ -567,6 +670,8 @@ func (s *Server) handleJSONRPCRequest(request JSONRPCRequest) JSONRPCResponse {
 			result, err = s.handleCreateContainer(ctx, req)
 		case "listContainers":
 			result, err = s.handleListContainers(ctx, req)
+		case "listImages":
+			result, err = s.handleListImages(ctx, req)
 		case "getContainerLogs":
 			result, err = s.handleGetContainerLogs(ctx, req)
 		case "inspectContainer":

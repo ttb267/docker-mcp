@@ -8,6 +8,7 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
 )
@@ -145,6 +146,33 @@ func (d *DockerClient) InspectContainer(ctx context.Context, containerID string)
 		return types.ContainerJSON{}, fmt.Errorf("failed to inspect container: %w", err)
 	}
 	return info, nil
+}
+
+// ImageInfo contains information about a Docker image
+type ImageInfo struct {
+	ID       string
+	RepoTags []string
+	Size     int64
+	Created  int64
+}
+
+func (d *DockerClient) ListImages(ctx context.Context) ([]ImageInfo, error) {
+	images, err := d.cli.ImageList(ctx, image.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list images: %w", err)
+	}
+
+	result := make([]ImageInfo, 0, len(images))
+	for _, img := range images {
+		result = append(result, ImageInfo{
+			ID:       img.ID,
+			RepoTags: img.RepoTags,
+			Size:     img.Size,
+			Created:  img.Created,
+		})
+	}
+
+	return result, nil
 }
 
 // ExecResult contains the result of executing a command in a container
