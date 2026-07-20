@@ -141,14 +141,14 @@ func (s *Server) registerTools() {
 
 	s.mcpServer.AddTool(
 		mcp.NewTool("execContainer",
-			mcp.WithDescription("Execute a command in a running container"),
+			mcp.WithDescription("Execute a safe command in a running container. Only supports: 1) modelscope download commands, 2) docker pull commands. Dangerous commands like rm, mv, cp, echo, chmod, curl, wget, bash, sh, python, etc. are blocked."),
 			mcp.WithString("container_id",
 				mcp.Required(),
 				mcp.Description("Container ID or name"),
 			),
 			mcp.WithString("cmd",
 				mcp.Required(),
-				mcp.Description("Command to execute (e.g., modelscope downloading model)"),
+				mcp.Description("Command to execute. Only modelscope and docker pull are allowed (e.g., modelscope download --model qwen --local_dir /data)"),
 			),
 		),
 		s.handleExecContainer,
@@ -285,6 +285,83 @@ func (s *Server) handleCreateComposeService(ctx context.Context, request mcp.Cal
 	return mcp.NewToolResultText(result), nil
 }
 
+// allowedCommands defines the allowed command patterns for execContainer
+var allowedCommands = []string{
+	"modelscope",
+	"docker pull",
+}
+
+// dangerousCommands defines commands that are not allowed
+var dangerousCommands = []string{
+	"rm",
+	"mv",
+	"cp",
+	"echo",
+	">",
+	">>",
+	"chmod",
+	"chown",
+	"touch",
+	"mkdir",
+	"rmdir",
+	"unlink",
+	"ln",
+	"sed",
+	"awk",
+	"perl",
+	"python",
+	"python3",
+	"node",
+	"bash",
+	"sh",
+	"powershell",
+	"curl",
+	"wget",
+	"nc",
+	"netcat",
+	"ssh",
+	"scp",
+	"ftp",
+	"sftp",
+}
+
+func isCommandAllowed(cmdStr string) (bool, string) {
+	// Check for dangerous commands
+	lowerCmd := strings.ToLower(cmdStr)
+	for _, dangerous := range dangerousCommands {
+		// Match whole word to avoid false positives (e.g., "docker" contains "rm")
+		if strings.Contains(lowerCmd, dangerous+" ") ||
+			strings.HasPrefix(lowerCmd, dangerous) ||
+			strings.Contains(lowerCmd, " "+dangerous) ||
+			strings.Contains(lowerCmd, "|"+dangerous) ||
+			strings.Contains(lowerCmd, "&&"+dangerous) ||
+			strings.Contains(lowerCmd, "; "+dangerous) {
+			return false, fmt.Sprintf("Command '%s' is not allowed for security reasons", dangerous)
+		}
+	}
+
+	// Check if command matches allowed patterns
+	isAllowed := false
+	var reason string
+	for _, allowed := range allowedCommands {
+		if strings.Contains(lowerCmd, allowed) {
+			isAllowed = true
+			if allowed == "modelscope" {
+				reason = "modelscope download command"
+			} else if allowed == "docker pull" {
+				reason = "docker pull command"
+			}
+			break
+		}
+	}
+
+	if !isAllowed {
+		return false, "Only modelscope download and docker pull commands are allowed"
+	}
+
+	return true, reason
+}
+
 func (s *Server) handleExecContainer(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	containerID := request.GetString("container_id", "")
 	if containerID == "" {
@@ -294,6 +371,11 @@ func (s *Server) handleExecContainer(ctx context.Context, request mcp.CallToolRe
 	cmdStr := request.GetString("cmd", "")
 	if cmdStr == "" {
 		return mcp.NewToolResultError("cmd is required"), nil
+	}
+
+	// Security check: validate command is allowed
+	if allowed, reason := isCommandAllowed(cmdStr); !allowed {
+		return mcp.NewToolResultError(fmt.Sprintf("Security rejected: %s", reason)), nil
 	}
 
 	// Split command string into slice
@@ -428,7 +510,7 @@ func (s *Server) handleJSONRPCRequest(request JSONRPCRequest) JSONRPCResponse {
 			{"name": "getContainerLogs", "description": "Get logs from a specific container"},
 			{"name": "inspectContainer", "description": "Get detailed information about a container"},
 			{"name": "createComposeService", "description": "Start services using docker-compose"},
-			{"name": "execContainer", "description": "Execute a command in a running container"},
+			{"name": "execContainer", "description": "Execute a safe command in a running container. Only supports: 1) modelscope download commands, 2) docker pull commands. Dangerous commands like rm, mv, cp, echo, chmod, curl, wget, bash, sh, python, etc. are blocked."},
 		}
 		return JSONRPCResponse{
 			JSONRPC: "2.0",
