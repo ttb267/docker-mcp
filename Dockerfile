@@ -1,5 +1,5 @@
 # Build stage
-FROM --platform=${BUILDPLATFORM:-linux/amd64} swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/library/golang:1.25.3-alpine AS builder
+FROM --platform=${BUILDPLATFORM:-linux/amd64} swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/library/golang:1.25.5-alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache git make
