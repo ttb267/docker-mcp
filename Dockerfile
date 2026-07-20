@@ -17,7 +17,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o docker-mcp ./cmd/server
 
 # Production stage
-FROM swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/library/alpine:3.19
+FROM swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/alpine:3.22
 
 # Install ca-certificates for HTTPS and docker-cli for docker socket access
 RUN apk add --no-cache ca-certificates docker-cli
