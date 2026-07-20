@@ -38,4 +38,4 @@ RUN adduser -D -u 1000 appuser
 USER appuser
 
 # Default to HTTP mode for remote access
-CMD ["--mode", "http", "--port", "8080"]
+CMD ["docker-mcp", "--mode", "http", "--port", "8080"]
