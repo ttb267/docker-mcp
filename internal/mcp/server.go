@@ -578,6 +578,7 @@ func (s *Server) RunHTTP(port string) error {
 
 	// MCP endpoint with authentication
 	http.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("[INFO] /mcp called from %s, method=%s", r.RemoteAddr, r.Method)
 		// Check authentication if enabled
 		if IsAuthEnabled() {
 			authHeader := r.Header.Get("Authorization")
@@ -658,6 +659,7 @@ func (s *Server) handleJSONRPCRequest(request JSONRPCRequest) JSONRPCResponse {
 
 	// Handle tools/list request
 	if request.Method == "tools/list" {
+		log.Printf("[INFO] tools/list called")
 		tools := []map[string]interface{}{
 			{
 				"name":        "createContainer",
@@ -747,6 +749,7 @@ func (s *Server) handleJSONRPCRequest(request JSONRPCRequest) JSONRPCResponse {
 
 	// Handle tools/call request
 	if request.Method == "tools/call" {
+		log.Printf("[INFO] tools/call called")
 		params, ok := request.Params.(map[string]interface{})
 		if !ok {
 			return JSONRPCResponse{
