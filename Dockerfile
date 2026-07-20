@@ -4,6 +4,9 @@ FROM --platform=${BUILDPLATFORM:-linux/amd64} swr.cn-north-4.myhuaweicloud.com/d
 # Install build dependencies
 RUN apk add --no-cache git make
 
+# Set Go module proxy for China
+RUN go env -w GOPROXY=https://goproxy.cn,direct
+
 WORKDIR /app
 
 # Copy go mod files
