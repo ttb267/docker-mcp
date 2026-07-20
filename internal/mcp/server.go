@@ -141,7 +141,7 @@ func (s *Server) registerTools() {
 
 	s.mcpServer.AddTool(
 		mcp.NewTool("execContainer",
-			mcp.WithDescription("Execute a safe command in a running container. Only supports: 1) modelscope download commands, 2) docker pull commands. Dangerous commands like rm, mv, cp, echo, chmod, curl, wget, bash, sh, python, etc. are blocked."),
+			mcp.WithDescription("Execute a safe command in a running container. Only supports: modelscope download, docker pull/tag/login/push. Dangerous commands like rm, mv, cp, echo, chmod, curl, wget, bash, sh, python, etc. are blocked."),
 			mcp.WithString("container_id",
 				mcp.Required(),
 				mcp.Description("Container ID or name"),
@@ -289,6 +289,9 @@ func (s *Server) handleCreateComposeService(ctx context.Context, request mcp.Cal
 var allowedCommands = []string{
 	"modelscope",
 	"docker pull",
+	"docker tag",
+	"docker login",
+	"docker push",
 }
 
 // dangerousCommands defines commands that are not allowed
@@ -346,17 +349,24 @@ func isCommandAllowed(cmdStr string) (bool, string) {
 	for _, allowed := range allowedCommands {
 		if strings.Contains(lowerCmd, allowed) {
 			isAllowed = true
-			if allowed == "modelscope" {
+			switch allowed {
+			case "modelscope":
 				reason = "modelscope download command"
-			} else if allowed == "docker pull" {
+			case "docker pull":
 				reason = "docker pull command"
+			case "docker tag":
+				reason = "docker tag command"
+			case "docker login":
+				reason = "docker login command"
+			case "docker push":
+				reason = "docker push command"
 			}
 			break
 		}
 	}
 
 	if !isAllowed {
-		return false, "Only modelscope download and docker pull commands are allowed"
+		return false, "Only modelscope download, docker pull, docker tag, docker login, docker push commands are allowed"
 	}
 
 	return true, reason
@@ -510,7 +520,7 @@ func (s *Server) handleJSONRPCRequest(request JSONRPCRequest) JSONRPCResponse {
 			{"name": "getContainerLogs", "description": "Get logs from a specific container"},
 			{"name": "inspectContainer", "description": "Get detailed information about a container"},
 			{"name": "createComposeService", "description": "Start services using docker-compose"},
-			{"name": "execContainer", "description": "Execute a safe command in a running container. Only supports: 1) modelscope download commands, 2) docker pull commands. Dangerous commands like rm, mv, cp, echo, chmod, curl, wget, bash, sh, python, etc. are blocked."},
+			{"name": "execContainer", "description": "Execute a safe command in a running container. Only supports: modelscope download, docker pull/tag/login/push. Dangerous commands like rm, mv, cp, echo, chmod, curl, wget, bash, sh, python, etc. are blocked."},
 		}
 		return JSONRPCResponse{
 			JSONRPC: "2.0",
