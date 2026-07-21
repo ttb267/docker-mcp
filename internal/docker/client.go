@@ -179,8 +179,42 @@ func (d *DockerClient) ListImages(ctx context.Context) ([]ImageInfo, error) {
 			Created:  img.Created,
 		})
 	}
-
 	return result, nil
+}
+
+// PullImage pulls an image from registry
+func (d *DockerClient) PullImage(ctx context.Context, imageName string) error {
+	out, err := d.cli.ImagePull(ctx, imageName, image.PullOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to pull image: %w", err)
+	}
+	defer out.Close()
+
+	// Wait for pull to complete by reading all output
+	_, err = io.Copy(io.Discard, out)
+	return err
+}
+
+// TagImage tags an image
+func (d *DockerClient) TagImage(ctx context.Context, source, target string) error {
+	err := d.cli.ImageTag(ctx, source, target)
+	if err != nil {
+		return fmt.Errorf("failed to tag image: %w", err)
+	}
+	return nil
+}
+
+// PushImage pushes an image to registry
+func (d *DockerClient) PushImage(ctx context.Context, imageName string) error {
+	out, err := d.cli.ImagePush(ctx, imageName, image.PushOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to push image: %w", err)
+	}
+	defer out.Close()
+
+	// Wait for push to complete
+	_, err = io.Copy(io.Discard, out)
+	return err
 }
 
 // ExecResult contains the result of executing a command in a container

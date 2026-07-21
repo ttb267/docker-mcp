@@ -109,6 +109,46 @@ func (s *Server) registerTools() {
 		s.handleListImages,
 	)
 
+	// Pull Image tool
+	s.mcpServer.AddTool(
+		mcp.NewTool("pullImage",
+			mcp.WithDescription("Pull an image from registry"),
+			mcp.WithString("image",
+				mcp.Required(),
+				mcp.Description("Image name to pull (e.g., nginx:latest, myregistry.com/myimage:tag)"),
+			),
+		),
+		s.handlePullImage,
+	)
+
+	// Tag Image tool
+	s.mcpServer.AddTool(
+		mcp.NewTool("tagImage",
+			mcp.WithDescription("Tag an image with a new name"),
+			mcp.WithString("source",
+				mcp.Required(),
+				mcp.Description("Source image name or ID"),
+			),
+			mcp.WithString("target",
+				mcp.Required(),
+				mcp.Description("Target image name and tag"),
+			),
+		),
+		s.handleTagImage,
+	)
+
+	// Push Image tool
+	s.mcpServer.AddTool(
+		mcp.NewTool("pushImage",
+			mcp.WithDescription("Push an image to registry"),
+			mcp.WithString("image",
+				mcp.Required(),
+				mcp.Description("Image name to push (e.g., myregistry.com/myimage:tag)"),
+			),
+		),
+		s.handlePushImage,
+	)
+
 	s.mcpServer.AddTool(
 		mcp.NewTool("getContainerLogs",
 			mcp.WithDescription("Get logs from a specific container"),
@@ -273,6 +313,54 @@ func (s *Server) handleListImages(ctx context.Context, request mcp.CallToolReque
 	}
 
 	return mcp.NewToolResultText(result), nil
+}
+
+func (s *Server) handlePullImage(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	log.Printf("[INFO] handlePullImage called")
+	image := request.GetString("image", "")
+	if image == "" {
+		return mcp.NewToolResultError("image is required"), nil
+	}
+
+	log.Printf("[INFO] Pulling image: %s", image)
+	err := s.dockerClient.PullImage(ctx, image)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to pull image: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(fmt.Sprintf("Image pulled successfully: %s", image)), nil
+}
+
+func (s *Server) handleTagImage(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	log.Printf("[INFO] handleTagImage called")
+	source := request.GetString("source", "")
+	target := request.GetString("target", "")
+	if source == "" || target == "" {
+		return mcp.NewToolResultError("source and target are required"), nil
+	}
+
+	err := s.dockerClient.TagImage(ctx, source, target)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to tag image: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(fmt.Sprintf("Image tagged: %s -> %s", source, target)), nil
+}
+
+func (s *Server) handlePushImage(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	log.Printf("[INFO] handlePushImage called")
+	image := request.GetString("image", "")
+	if image == "" {
+		return mcp.NewToolResultError("image is required"), nil
+	}
+
+	log.Printf("[INFO] Pushing image: %s", image)
+	err := s.dockerClient.PushImage(ctx, image)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to push image: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(fmt.Sprintf("Image pushed successfully: %s", image)), nil
 }
 
 func (s *Server) handleGetContainerLogs(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -766,6 +854,40 @@ func (s *Server) handleJSONRPCRequest(request JSONRPCRequest) JSONRPCResponse {
 				},
 			},
 			{
+				"name":        "pullImage",
+				"description": "Pull an image from registry",
+				"inputSchema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"image": map[string]interface{}{"type": "string", "description": "Image name to pull"},
+					},
+					"required": []string{"image"},
+				},
+			},
+			{
+				"name":        "tagImage",
+				"description": "Tag an image with a new name",
+				"inputSchema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"source": map[string]interface{}{"type": "string", "description": "Source image name or ID"},
+						"target": map[string]interface{}{"type": "string", "description": "Target image name and tag"},
+					},
+					"required": []string{"source", "target"},
+				},
+			},
+			{
+				"name":        "pushImage",
+				"description": "Push an image to registry",
+				"inputSchema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"image": map[string]interface{}{"type": "string", "description": "Image name to push"},
+					},
+					"required": []string{"image"},
+				},
+			},
+			{
 				"name":        "getContainerLogs",
 				"description": "Get logs from a specific container",
 				"inputSchema": map[string]interface{}{
@@ -873,6 +995,12 @@ func (s *Server) handleJSONRPCRequest(request JSONRPCRequest) JSONRPCResponse {
 			result, err = s.handleListContainers(ctx, req)
 		case "listImages":
 			result, err = s.handleListImages(ctx, req)
+		case "pullImage":
+			result, err = s.handlePullImage(ctx, req)
+		case "tagImage":
+			result, err = s.handleTagImage(ctx, req)
+		case "pushImage":
+			result, err = s.handlePushImage(ctx, req)
 		case "getContainerLogs":
 			result, err = s.handleGetContainerLogs(ctx, req)
 		case "inspectContainer":
