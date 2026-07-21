@@ -150,7 +150,7 @@ func (s *Server) registerTools() {
 
 	s.mcpServer.AddTool(
 		mcp.NewTool("execContainer",
-			mcp.WithDescription("Execute a safe command in a running container. Use detach=true for long-running commands."),
+			mcp.WithDescription("Execute a command in a running container. Long-running commands (modelscope, wget, curl, download, etc.) will auto-stream output."),
 			mcp.WithString("container_id",
 				mcp.Required(),
 				mcp.Description("Container ID or name"),
@@ -161,9 +161,6 @@ func (s *Server) registerTools() {
 			),
 			mcp.WithString("env",
 				mcp.Description("Environment variables (e.g., HTTP_PROXY=http://proxy:8080)"),
-			),
-			mcp.WithBoolean("detach",
-				mcp.Description("Run command in background and return immediately"),
 			),
 		),
 		s.handleExecContainer,
@@ -503,6 +500,34 @@ func isCommandAllowed(cmdStr string) (bool, string) {
 	return true, reason
 }
 
+// isLongRunningCommand checks if command is a long-running task that should auto-detach
+func isLongRunningCommand(cmdStr string) bool {
+	lowerCmd := strings.ToLower(cmdStr)
+	longRunningKeywords := []string{
+		"modelscope",
+		"download",
+		"wget",
+		"curl",
+		"pip install",
+		"pip3 install",
+		"apt-get install",
+		"apk add",
+		"git clone",
+		"git pull",
+		"docker pull",
+		"tar -",
+		"unzip",
+		"gunzip",
+	}
+
+	for _, keyword := range longRunningKeywords {
+		if strings.Contains(lowerCmd, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) handleExecContainer(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	log.Printf("[INFO] handleExecContainer called")
 	containerID := request.GetString("container_id", "")
@@ -523,7 +548,11 @@ func (s *Server) handleExecContainer(ctx context.Context, request mcp.CallToolRe
 	}
 
 	// Get optional detach parameter (default: false)
-	detach := request.GetBool("detach", false)
+	// Get optional detach parameter (default: false)
+	userDetach := request.GetBool("detach", false)
+
+	// Auto-detach for long-running commands
+	detach := userDetach || isLongRunningCommand(cmdStr)
 
 	// Security check: validate command is allowed
 	if allowed, reason := isCommandAllowed(cmdStr); !allowed {
@@ -773,14 +802,13 @@ func (s *Server) handleJSONRPCRequest(request JSONRPCRequest) JSONRPCResponse {
 			},
 			{
 				"name":        "execContainer",
-				"description": "Execute a safe command in a running container. Use detach=true for long-running commands like modelscope download.",
+				"description": "Execute a command in a running container. Long-running commands (modelscope, wget, curl, download, etc.) will auto-stream output.",
 				"inputSchema": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
 						"container_id": map[string]interface{}{"type": "string", "description": "Container ID or name"},
 						"cmd":          map[string]interface{}{"type": "string", "description": "Command to execute"},
 						"env":          map[string]interface{}{"type": "string", "description": "Environment variables (e.g., HTTP_PROXY=http://proxy:8080)"},
-						"detach":       map[string]interface{}{"type": "boolean", "description": "Run command in background and return immediately"},
 					},
 					"required": []string{"container_id", "cmd"},
 				},
