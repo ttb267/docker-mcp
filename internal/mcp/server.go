@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -581,16 +582,16 @@ func isCommandAllowed(cmdStr string) (bool, string) {
 	lowerCmd := strings.ToLower(cmdStr)
 
 	// Check for dangerous commands FIRST - reject immediately if found
-	for _, dangerous := range dangerousCommands {
-		if strings.Contains(lowerCmd, dangerous+" ") ||
-			strings.HasPrefix(lowerCmd, dangerous) ||
-			strings.Contains(lowerCmd, " "+dangerous) ||
-			strings.Contains(lowerCmd, "|"+dangerous) ||
-			strings.Contains(lowerCmd, "&&"+dangerous) ||
-			strings.Contains(lowerCmd, "; "+dangerous) {
-			log.Printf("[SECURITY] [REJECTED] execContainer - Command blocked: '%s' in cmd: '%s' - %s",
-				dangerous, cmdStr, time.Now().Format(time.RFC3339))
-			return false, fmt.Sprintf("Command '%s' is not allowed for security reasons", dangerous)
+	// Split by delimiters and check each token to avoid false positives (e.g., "push" contains "sh")
+	tokens := regexp.MustCompile(`[\s|&;]+`).Split(cmdStr, -1)
+	for _, token := range tokens {
+		token = strings.TrimSpace(token)
+		for _, dangerous := range dangerousCommands {
+			if token == dangerous {
+				log.Printf("[SECURITY] [REJECTED] execContainer - Command blocked: '%s' in cmd: '%s' - %s",
+					dangerous, cmdStr, time.Now().Format(time.RFC3339))
+				return false, fmt.Sprintf("Command '%s' is not allowed for security reasons", dangerous)
+			}
 		}
 	}
 
