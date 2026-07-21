@@ -36,9 +36,9 @@ ENV PATH="/app:${PATH}"
 # Expose HTTP port for remote agent
 EXPOSE 8080
 
-# Create non-root user for security
-RUN adduser -D -u 1000 appuser
-USER appuser
+# Note: Running as root because Docker socket access requires privileges
+# For production, use --user flag when running container with mounted docker.sock
+# e.g., docker run -v /var/run/docker.sock:/var/run/docker.sock --user=1000:999 ...
 
 # Default to HTTP mode for remote access
 CMD ["docker-mcp", "--mode", "http", "--port", "8080"]
