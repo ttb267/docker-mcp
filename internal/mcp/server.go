@@ -150,7 +150,7 @@ func (s *Server) registerTools() {
 
 	s.mcpServer.AddTool(
 		mcp.NewTool("execContainer",
-			mcp.WithDescription("Execute a safe command in a running container. Only supports: modelscope download, docker pull/tag/login/push, ls, tar, unzip, etc. Dangerous commands like rm, mv, cp, echo, chmod, bash, sh, python, etc. are blocked."),
+			mcp.WithDescription("Execute a safe command in a running container. Use detach=true for long-running commands."),
 			mcp.WithString("container_id",
 				mcp.Required(),
 				mcp.Description("Container ID or name"),
@@ -162,8 +162,23 @@ func (s *Server) registerTools() {
 			mcp.WithString("env",
 				mcp.Description("Environment variables (e.g., HTTP_PROXY=http://proxy:8080)"),
 			),
+			mcp.WithBoolean("detach",
+				mcp.Description("Run command in background and return immediately"),
+			),
 		),
 		s.handleExecContainer,
+	)
+
+	// execContainerStatus tool for checking detached command status
+	s.mcpServer.AddTool(
+		mcp.NewTool("execContainerStatus",
+			mcp.WithDescription("Check the status of a detached exec command"),
+			mcp.WithString("exec_id",
+				mcp.Required(),
+				mcp.Description("Exec ID returned from execContainer with detach=true"),
+			),
+		),
+		s.handleExecContainerStatus,
 	)
 }
 
@@ -507,6 +522,9 @@ func (s *Server) handleExecContainer(ctx context.Context, request mcp.CallToolRe
 		env = splitAndTrim(envStr)
 	}
 
+	// Get optional detach parameter (default: false)
+	detach := request.GetBool("detach", false)
+
 	// Security check: validate command is allowed
 	if allowed, reason := isCommandAllowed(cmdStr); !allowed {
 		return mcp.NewToolResultError(fmt.Sprintf("Security rejected: %s", reason)), nil
@@ -515,12 +533,28 @@ func (s *Server) handleExecContainer(ctx context.Context, request mcp.CallToolRe
 	// Split command string into slice (by whitespace, not comma)
 	cmd := strings.Fields(cmdStr)
 
-	result, err := s.dockerClient.ExecContainer(ctx, containerID, cmd, env)
+	result, err := s.dockerClient.ExecContainer(ctx, containerID, cmd, env, detach)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to exec in container: %v", err)), nil
 	}
 
 	output := fmt.Sprintf("Exit Code: %d\nOutput: %s", result.ExitCode, result.Output)
+	return mcp.NewToolResultText(output), nil
+}
+
+func (s *Server) handleExecContainerStatus(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	log.Printf("[INFO] handleExecContainerStatus called")
+	execID := request.GetString("exec_id", "")
+	if execID == "" {
+		return mcp.NewToolResultError("exec_id is required. Use the Exec ID returned from execContainer with detach=true"), nil
+	}
+
+	result, err := s.dockerClient.ExecContainerStatus(ctx, execID)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to get exec status: %v", err)), nil
+	}
+
+	output := fmt.Sprintf("Exec ID: %s\n%s", result.ExecID, result.Output)
 	return mcp.NewToolResultText(output), nil
 }
 
@@ -739,15 +773,27 @@ func (s *Server) handleJSONRPCRequest(request JSONRPCRequest) JSONRPCResponse {
 			},
 			{
 				"name":        "execContainer",
-				"description": "Execute a safe command in a running container. Only supports: modelscope download, docker pull/tag/login/push, ls, tar, unzip, etc. Dangerous commands like rm, mv, cp, echo, chmod, bash, sh, python, etc. are blocked.",
+				"description": "Execute a safe command in a running container. Use detach=true for long-running commands like modelscope download.",
 				"inputSchema": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
 						"container_id": map[string]interface{}{"type": "string", "description": "Container ID or name"},
 						"cmd":          map[string]interface{}{"type": "string", "description": "Command to execute"},
 						"env":          map[string]interface{}{"type": "string", "description": "Environment variables (e.g., HTTP_PROXY=http://proxy:8080)"},
+						"detach":       map[string]interface{}{"type": "boolean", "description": "Run command in background and return immediately"},
 					},
 					"required": []string{"container_id", "cmd"},
+				},
+			},
+			{
+				"name":        "execContainerStatus",
+				"description": "Check the status of a detached exec command",
+				"inputSchema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"exec_id": map[string]interface{}{"type": "string", "description": "Exec ID returned from execContainer with detach=true"},
+					},
+					"required": []string{"exec_id"},
 				},
 			},
 		}
@@ -807,6 +853,8 @@ func (s *Server) handleJSONRPCRequest(request JSONRPCRequest) JSONRPCResponse {
 			result, err = s.handleCreateComposeService(ctx, req)
 		case "execContainer":
 			result, err = s.handleExecContainer(ctx, req)
+		case "execContainerStatus":
+			result, err = s.handleExecContainerStatus(ctx, req)
 		default:
 			return JSONRPCResponse{
 				JSONRPC: "2.0",

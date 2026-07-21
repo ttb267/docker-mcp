@@ -182,6 +182,7 @@ func (d *DockerClient) ListImages(ctx context.Context) ([]ImageInfo, error) {
 
 // ExecResult contains the result of executing a command in a container
 type ExecResult struct {
+	ExecID   string
 	ExitCode int
 	Output   string
 	Error    string
@@ -189,7 +190,8 @@ type ExecResult struct {
 
 // ExecContainer executes a command in a running container
 // env: optional environment variables to pass to the command
-func (d *DockerClient) ExecContainer(ctx context.Context, containerID string, cmd []string, env []string) (*ExecResult, error) {
+// detach: if true, start command in background and return immediately
+func (d *DockerClient) ExecContainer(ctx context.Context, containerID string, cmd []string, env []string, detach bool) (*ExecResult, error) {
 	// First, create the exec instance
 	execConfig := types.ExecConfig{
 		Cmd:          cmd,
@@ -202,6 +204,19 @@ func (d *DockerClient) ExecContainer(ctx context.Context, containerID string, cm
 	execID, err := d.cli.ContainerExecCreate(ctx, containerID, execConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create exec: %w", err)
+	}
+
+	// If detach mode, start and return immediately without waiting
+	if detach {
+		err = d.cli.ContainerExecStart(ctx, execID.ID, types.ExecStartCheck{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to start exec: %w", err)
+		}
+		return &ExecResult{
+			ExecID:   execID.ID,
+			ExitCode: -1,
+			Output:   fmt.Sprintf("Command started in background. Exec ID: %s. Use execContainerStatus to check progress.", execID.ID),
+		}, nil
 	}
 
 	// Start the exec with hijacked connection to get output
@@ -234,5 +249,27 @@ func (d *DockerClient) ExecContainer(ctx context.Context, containerID string, cm
 	return &ExecResult{
 		ExitCode: inspectResp.ExitCode,
 		Output:   string(output),
+	}, nil
+}
+
+// ExecContainerStatus checks the status of a detached exec command
+func (d *DockerClient) ExecContainerStatus(ctx context.Context, execID string) (*ExecResult, error) {
+	inspectResp, err := d.cli.ContainerExecInspect(ctx, execID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect exec: %w", err)
+	}
+
+	if inspectResp.Running {
+		return &ExecResult{
+			ExecID:   execID,
+			ExitCode: -1,
+			Output:   "Command is still running...",
+		}, nil
+	}
+
+	return &ExecResult{
+		ExecID:   execID,
+		ExitCode: inspectResp.ExitCode,
+		Output:   fmt.Sprintf("Command finished with exit code: %d", inspectResp.ExitCode),
 	}, nil
 }
