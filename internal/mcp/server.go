@@ -578,20 +578,10 @@ func isContainerCmdAllowed(cmdStr string) (bool, string) {
 }
 
 func isCommandAllowed(cmdStr string) (bool, string) {
-	// Check allowed commands FIRST - if matched, allow immediately
 	lowerCmd := strings.ToLower(cmdStr)
-	for _, allowed := range allowedCommands {
-		if strings.Contains(lowerCmd, allowed) {
-			log.Printf("[SECURITY] [ALLOWED] execContainer - Command allowed: '%s' in cmd: '%s' - %s",
-				allowed, cmdStr, time.Now().Format(time.RFC3339))
-			reason := fmt.Sprintf("%s command is allowed", allowed)
-			return true, reason
-		}
-	}
 
-	// Only check dangerous commands if not in allowed list
+	// Check for dangerous commands FIRST - reject immediately if found
 	for _, dangerous := range dangerousCommands {
-		// Match whole word to avoid false positives (e.g., "docker" contains "rm")
 		if strings.Contains(lowerCmd, dangerous+" ") ||
 			strings.HasPrefix(lowerCmd, dangerous) ||
 			strings.Contains(lowerCmd, " "+dangerous) ||
@@ -601,6 +591,16 @@ func isCommandAllowed(cmdStr string) (bool, string) {
 			log.Printf("[SECURITY] [REJECTED] execContainer - Command blocked: '%s' in cmd: '%s' - %s",
 				dangerous, cmdStr, time.Now().Format(time.RFC3339))
 			return false, fmt.Sprintf("Command '%s' is not allowed for security reasons", dangerous)
+		}
+	}
+
+	// Only if no dangerous commands found, check if it's in allowed list
+	for _, allowed := range allowedCommands {
+		if strings.Contains(lowerCmd, allowed) {
+			log.Printf("[SECURITY] [ALLOWED] execContainer - Command allowed: '%s' in cmd: '%s' - %s",
+				allowed, cmdStr, time.Now().Format(time.RFC3339))
+			reason := fmt.Sprintf("%s command is allowed", allowed)
+			return true, reason
 		}
 	}
 
