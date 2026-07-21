@@ -149,6 +149,26 @@ func (s *Server) registerTools() {
 		s.handlePushImage,
 	)
 
+	// Login to Registry tool
+	s.mcpServer.AddTool(
+		mcp.NewTool("loginToRegistry",
+			mcp.WithDescription("Login to a Docker registry"),
+			mcp.WithString("registry",
+				mcp.Required(),
+				mcp.Description("Registry address (e.g., docker.io, myregistry.com)"),
+			),
+			mcp.WithString("username",
+				mcp.Required(),
+				mcp.Description("Username"),
+			),
+			mcp.WithString("password",
+				mcp.Required(),
+				mcp.Description("Password"),
+			),
+		),
+		s.handleLoginToRegistry,
+	)
+
 	s.mcpServer.AddTool(
 		mcp.NewTool("getContainerLogs",
 			mcp.WithDescription("Get logs from a specific container"),
@@ -361,6 +381,25 @@ func (s *Server) handlePushImage(ctx context.Context, request mcp.CallToolReques
 	}
 
 	return mcp.NewToolResultText(fmt.Sprintf("Image pushed successfully: %s", image)), nil
+}
+
+func (s *Server) handleLoginToRegistry(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	log.Printf("[INFO] handleLoginToRegistry called")
+	registry := request.GetString("registry", "")
+	username := request.GetString("username", "")
+	password := request.GetString("password", "")
+
+	if registry == "" || username == "" || password == "" {
+		return mcp.NewToolResultError("registry, username, password are required"), nil
+	}
+
+	log.Printf("[INFO] Logging in to registry: %s", registry)
+	err := s.dockerClient.LoginToRegistry(ctx, registry, username, password)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to login: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(fmt.Sprintf("Login successful to %s", registry)), nil
 }
 
 func (s *Server) handleGetContainerLogs(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -888,6 +927,19 @@ func (s *Server) handleJSONRPCRequest(request JSONRPCRequest) JSONRPCResponse {
 				},
 			},
 			{
+				"name":        "loginToRegistry",
+				"description": "Login to a Docker registry",
+				"inputSchema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"registry": map[string]interface{}{"type": "string", "description": "Registry address"},
+						"username": map[string]interface{}{"type": "string", "description": "Username"},
+						"password": map[string]interface{}{"type": "string", "description": "Password"},
+					},
+					"required": []string{"registry", "username", "password"},
+				},
+			},
+			{
 				"name":        "getContainerLogs",
 				"description": "Get logs from a specific container",
 				"inputSchema": map[string]interface{}{
@@ -1001,6 +1053,8 @@ func (s *Server) handleJSONRPCRequest(request JSONRPCRequest) JSONRPCResponse {
 			result, err = s.handleTagImage(ctx, req)
 		case "pushImage":
 			result, err = s.handlePushImage(ctx, req)
+		case "loginToRegistry":
+			result, err = s.handleLoginToRegistry(ctx, req)
 		case "getContainerLogs":
 			result, err = s.handleGetContainerLogs(ctx, req)
 		case "inspectContainer":

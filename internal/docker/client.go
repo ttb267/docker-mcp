@@ -11,12 +11,14 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/client"
+	dockerclient "github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
 )
 
 type DockerClient struct {
-	cli *client.Client
+	cli *dockerclient.Client
 }
 
 type ContainerConfig struct {
@@ -201,6 +203,23 @@ func (d *DockerClient) TagImage(ctx context.Context, source, target string) erro
 	if err != nil {
 		return fmt.Errorf("failed to tag image: %w", err)
 	}
+	return nil
+}
+
+// LoginToRegistry logs in to a registry
+func (d *DockerClient) LoginToRegistry(ctx context.Context, registryAddr, username, password string) error {
+	authConfig := registry.AuthConfig{
+		Username:      username,
+		Password:      password,
+		ServerAddress: registryAddr,
+	}
+
+	response, err := d.cli.RegistryLogin(ctx, authConfig)
+	if err != nil {
+		return fmt.Errorf("login failed: %w", err)
+	}
+
+	fmt.Printf("Login successful: %s\n", response.Status)
 	return nil
 }
 
