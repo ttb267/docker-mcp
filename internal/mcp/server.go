@@ -578,8 +578,18 @@ func isContainerCmdAllowed(cmdStr string) (bool, string) {
 }
 
 func isCommandAllowed(cmdStr string) (bool, string) {
-	// Check for dangerous commands
+	// Check allowed commands FIRST - if matched, allow immediately
 	lowerCmd := strings.ToLower(cmdStr)
+	for _, allowed := range allowedCommands {
+		if strings.Contains(lowerCmd, allowed) {
+			log.Printf("[SECURITY] [ALLOWED] execContainer - Command allowed: '%s' in cmd: '%s' - %s",
+				allowed, cmdStr, time.Now().Format(time.RFC3339))
+			reason := fmt.Sprintf("%s command is allowed", allowed)
+			return true, reason
+		}
+	}
+
+	// Only check dangerous commands if not in allowed list
 	for _, dangerous := range dangerousCommands {
 		// Match whole word to avoid false positives (e.g., "docker" contains "rm")
 		if strings.Contains(lowerCmd, dangerous+" ") ||
@@ -594,37 +604,10 @@ func isCommandAllowed(cmdStr string) (bool, string) {
 		}
 	}
 
-	// Check if command matches allowed patterns
-	isAllowed := false
-	var reason string
-	for _, allowed := range allowedCommands {
-		if strings.Contains(lowerCmd, allowed) {
-			isAllowed = true
-			log.Printf("[SECURITY] [ALLOWED] execContainer - Command allowed: '%s' in cmd: '%s' - %s",
-				allowed, cmdStr, time.Now().Format(time.RFC3339))
-			switch allowed {
-			case "modelscope":
-				reason = "modelscope download command"
-			case "docker pull":
-				reason = "docker pull command"
-			case "docker tag":
-				reason = "docker tag command"
-			case "docker login":
-				reason = "docker login command"
-			case "docker push":
-				reason = "docker push command"
-			}
-			break
-		}
-	}
-
-	if !isAllowed {
-		log.Printf("[SECURITY] [REJECTED] execContainer - No allowed command found in cmd: '%s' - %s",
-			cmdStr, time.Now().Format(time.RFC3339))
-		return false, "Only modelscope download, docker pull, docker tag, docker login, docker push commands are allowed"
-	}
-
-	return true, reason
+	// If not in allowed list and not dangerous, reject
+	log.Printf("[SECURITY] [REJECTED] execContainer - No allowed command found in cmd: '%s' - %s",
+		cmdStr, time.Now().Format(time.RFC3339))
+	return false, "Only modelscope download, docker pull, docker tag, docker login, docker push commands are allowed"
 }
 
 // isLongRunningCommand checks if command is a long-running task that should auto-detach
