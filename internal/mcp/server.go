@@ -150,14 +150,17 @@ func (s *Server) registerTools() {
 
 	s.mcpServer.AddTool(
 		mcp.NewTool("execContainer",
-			mcp.WithDescription("Execute a safe command in a running container. Only supports: modelscope download, docker pull/tag/login/push. Dangerous commands like rm, mv, cp, echo, chmod, curl, wget, bash, sh, python, etc. are blocked."),
+			mcp.WithDescription("Execute a safe command in a running container. Only supports: modelscope download, docker pull/tag/login/push, ls, tar, unzip, etc. Dangerous commands like rm, mv, cp, echo, chmod, bash, sh, python, etc. are blocked."),
 			mcp.WithString("container_id",
 				mcp.Required(),
 				mcp.Description("Container ID or name"),
 			),
 			mcp.WithString("cmd",
 				mcp.Required(),
-				mcp.Description("Command to execute. Only modelscope and docker pull are allowed (e.g., modelscope download --model qwen --local_dir /data)"),
+				mcp.Description("Command to execute"),
+			),
+			mcp.WithString("env",
+				mcp.Description("Environment variables (e.g., HTTP_PROXY=http://proxy:8080)"),
 			),
 		),
 		s.handleExecContainer,
@@ -497,6 +500,13 @@ func (s *Server) handleExecContainer(ctx context.Context, request mcp.CallToolRe
 		return mcp.NewToolResultError("cmd is required"), nil
 	}
 
+	// Get optional env variables (e.g., "HTTP_PROXY=http://proxy:8080,HTTPS_PROXY=http://proxy:8080")
+	envStr := request.GetString("env", "")
+	var env []string
+	if envStr != "" {
+		env = splitAndTrim(envStr)
+	}
+
 	// Security check: validate command is allowed
 	if allowed, reason := isCommandAllowed(cmdStr); !allowed {
 		return mcp.NewToolResultError(fmt.Sprintf("Security rejected: %s", reason)), nil
@@ -505,7 +515,7 @@ func (s *Server) handleExecContainer(ctx context.Context, request mcp.CallToolRe
 	// Split command string into slice (by whitespace, not comma)
 	cmd := strings.Fields(cmdStr)
 
-	result, err := s.dockerClient.ExecContainer(ctx, containerID, cmd)
+	result, err := s.dockerClient.ExecContainer(ctx, containerID, cmd, env)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to exec in container: %v", err)), nil
 	}
@@ -729,12 +739,13 @@ func (s *Server) handleJSONRPCRequest(request JSONRPCRequest) JSONRPCResponse {
 			},
 			{
 				"name":        "execContainer",
-				"description": "Execute a safe command in a running container. Only supports: modelscope download, docker pull/tag/login/push. Dangerous commands like rm, mv, cp, echo, chmod, curl, wget, bash, sh, python, etc. are blocked.",
+				"description": "Execute a safe command in a running container. Only supports: modelscope download, docker pull/tag/login/push, ls, tar, unzip, etc. Dangerous commands like rm, mv, cp, echo, chmod, bash, sh, python, etc. are blocked.",
 				"inputSchema": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
 						"container_id": map[string]interface{}{"type": "string", "description": "Container ID or name"},
-						"cmd":          map[string]interface{}{"type": "string", "description": "Command to execute. Only modelscope and docker pull/tag/login/push are allowed"},
+						"cmd":          map[string]interface{}{"type": "string", "description": "Command to execute"},
+						"env":          map[string]interface{}{"type": "string", "description": "Environment variables (e.g., HTTP_PROXY=http://proxy:8080)"},
 					},
 					"required": []string{"container_id", "cmd"},
 				},

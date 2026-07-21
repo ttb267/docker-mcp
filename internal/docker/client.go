@@ -188,13 +188,15 @@ type ExecResult struct {
 }
 
 // ExecContainer executes a command in a running container
-func (d *DockerClient) ExecContainer(ctx context.Context, containerID string, cmd []string) (*ExecResult, error) {
+// env: optional environment variables to pass to the command
+func (d *DockerClient) ExecContainer(ctx context.Context, containerID string, cmd []string, env []string) (*ExecResult, error) {
 	// First, create the exec instance
 	execConfig := types.ExecConfig{
 		Cmd:          cmd,
 		AttachStdout: true,
 		AttachStderr: true,
 		Tty:          false,
+		Env:          env,
 	}
 
 	execID, err := d.cli.ContainerExecCreate(ctx, containerID, execConfig)
