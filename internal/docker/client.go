@@ -1,9 +1,12 @@
 package docker
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -206,16 +209,64 @@ func (d *DockerClient) ExecContainer(ctx context.Context, containerID string, cm
 		return nil, fmt.Errorf("failed to create exec: %w", err)
 	}
 
-	// If detach mode, start and return immediately without waiting
+	// If detach mode, stream output in real-time
 	if detach {
 		err = d.cli.ContainerExecStart(ctx, execID.ID, types.ExecStartCheck{})
 		if err != nil {
 			return nil, fmt.Errorf("failed to start exec: %w", err)
 		}
+
+		// Attach and stream output
+		resp, err := d.cli.ContainerExecAttach(ctx, execID.ID, types.ExecStartCheck{
+			Tty: false,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to attach exec: %w", err)
+		}
+		defer resp.Close()
+
+		// Stream output in real-time - read continuously until command finishes
+		var output bytes.Buffer
+		readChan := make(chan error, 1)
+
+		// Start reading in background
+		go func() {
+			buf := make([]byte, 4096)
+			for {
+				n, err := resp.Reader.Read(buf)
+				if n > 0 {
+					output.Write(buf[:n])
+					// Keep writing to show progress
+					fmt.Fprintf(os.Stdout, "%s", string(buf[:n]))
+				}
+				if err != nil {
+					break
+				}
+			}
+			readChan <- err
+		}()
+
+		// Wait for exec to finish
+		for {
+			inspectResp, err := d.cli.ContainerExecInspect(ctx, execID.ID)
+			if err != nil {
+				break
+			}
+			if !inspectResp.Running {
+				// Command finished
+				return &ExecResult{
+					ExecID:   execID.ID,
+					ExitCode: inspectResp.ExitCode,
+					Output:   output.String(),
+				}, nil
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+
 		return &ExecResult{
 			ExecID:   execID.ID,
 			ExitCode: -1,
-			Output:   fmt.Sprintf("Command started in background. Exec ID: %s. Use execContainerStatus to check progress.", execID.ID),
+			Output:   output.String(),
 		}, nil
 	}
 
