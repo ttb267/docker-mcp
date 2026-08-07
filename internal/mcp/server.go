@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -237,6 +238,24 @@ func (s *Server) registerTools() {
 			),
 		),
 		s.handleExecContainerStatus,
+	)
+
+	// checkGitHubRelease tool for checking GitHub repo releases and roadmap
+	s.mcpServer.AddTool(
+		mcp.NewTool("checkGitHubRelease",
+			mcp.WithDescription("Check a GitHub repository for new releases, release notes, and roadmap updates. Supports proxy via HTTP_PROXY/HTTPS_PROXY env vars and optional GITHUB_TOKEN for higher rate limits."),
+			mcp.WithString("repo",
+				mcp.Required(),
+				mcp.Description("GitHub repository in owner/repo format (e.g., sgl-project/sglang)"),
+			),
+			mcp.WithString("current_version",
+				mcp.Description("Current version you have (e.g., v0.3.0). If provided, only shows newer releases."),
+			),
+			mcp.WithBoolean("include_roadmap",
+				mcp.Description("Whether to fetch roadmap information (default: true)"),
+			),
+		),
+		s.handleCheckGitHubRelease,
 	)
 }
 
@@ -700,6 +719,187 @@ func (s *Server) handleExecContainerStatus(ctx context.Context, request mcp.Call
 	return mcp.NewToolResultText(output), nil
 }
 
+// githubRelease represents a GitHub release from the API response
+type githubRelease struct {
+	TagName     string `json:"tag_name"`
+	Name        string `json:"name"`
+	Body        string `json:"body"`
+	HTMLURL     string `json:"html_url"`
+	PublishedAt string `json:"published_at"`
+	PreRelease  bool   `json:"prerelease"`
+	Draft       bool   `json:"draft"`
+}
+
+// httpClientWithProxy creates an HTTP client that respects proxy env vars
+func httpClientWithProxy() *http.Client {
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+		},
+	}
+}
+
+// githubAPIRequest makes an authenticated request to GitHub API with optional token
+func githubAPIRequest(url string) (*http.Response, error) {
+	client := httpClientWithProxy()
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	return client.Do(req)
+}
+
+// fetchGitHubReleases fetches releases for a repo (owner/repo format)
+func fetchGitHubReleases(repo string) ([]githubRelease, error) {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/releases?per_page=10", repo)
+	resp, err := githubAPIRequest(url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch releases: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 404 {
+		return nil, fmt.Errorf("repository '%s' not found", repo)
+	}
+	if resp.StatusCode == 403 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("GitHub API rate limit exceeded or forbidden: %s", string(body))
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("GitHub API returned status %d", resp.StatusCode)
+	}
+
+	var releases []githubRelease
+	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+		return nil, fmt.Errorf("failed to parse releases: %w", err)
+	}
+	return releases, nil
+}
+
+// fetchRawFile fetches a raw file from GitHub, trying main then master branch
+func fetchRawFile(repo, path string) (string, error) {
+	branches := []string{"main", "master"}
+	var lastErr error
+	for _, branch := range branches {
+		url := fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s", repo, branch, path)
+		resp, err := githubAPIRequest(url)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == 200 {
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			return string(body), nil
+		}
+		lastErr = fmt.Errorf("status %d from %s", resp.StatusCode, url)
+	}
+	return "", lastErr
+}
+
+func (s *Server) handleCheckGitHubRelease(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	log.Printf("[INFO] handleCheckGitHubRelease called")
+
+	repo := request.GetString("repo", "")
+	if repo == "" {
+		return mcp.NewToolResultError("repo is required (e.g., sgl-project/sglang)"), nil
+	}
+
+	currentVersion := request.GetString("current_version", "")
+	includeRoadmap := request.GetBool("include_roadmap", true)
+
+	// Fetch releases
+	releases, err := fetchGitHubReleases(repo)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to fetch releases: %v", err)), nil
+	}
+
+	if len(releases) == 0 {
+		return mcp.NewToolResultText(fmt.Sprintf("No releases found for %s", repo)), nil
+	}
+
+	// Build result
+	var result strings.Builder
+	result.WriteString(fmt.Sprintf("=== GitHub Releases for %s ===\n\n", repo))
+
+	// Filter by current version if provided
+	newerOnly := currentVersion != ""
+	if newerOnly {
+		result.WriteString(fmt.Sprintf("Current version: %s\n", currentVersion))
+	}
+
+	found := false
+	for _, r := range releases {
+		if r.Draft {
+			continue
+		}
+		if newerOnly && r.TagName == currentVersion {
+			break // releases are sorted newest-first, stop here
+		}
+
+		label := ""
+		if r.PreRelease {
+			label = " [pre-release]"
+		}
+		result.WriteString(fmt.Sprintf("## %s%s\n", r.TagName, label))
+		result.WriteString(fmt.Sprintf("Published: %s\n", r.PublishedAt))
+		result.WriteString(fmt.Sprintf("URL: %s\n", r.HTMLURL))
+		if r.Body != "" {
+			// Truncate very long release notes
+			notes := r.Body
+			if len(notes) > 2000 {
+				notes = notes[:2000] + "\n... (truncated, see full notes at URL above)"
+			}
+			result.WriteString(fmt.Sprintf("Release Notes:\n%s\n", notes))
+		} else {
+			result.WriteString("Release Notes: (none provided)\n")
+		}
+		result.WriteString("\n")
+		found = true
+	}
+
+	if newerOnly && !found {
+		result.WriteString(fmt.Sprintf("No new releases found after %s\n", currentVersion))
+	}
+
+	// Fetch roadmap if requested
+	if includeRoadmap {
+		result.WriteString("\n=== Roadmap ===\n")
+		roadmapPaths := []string{
+			"docs/references/roadmap.rst",
+			"docs/roadmap.md",
+			"ROADMAP.md",
+		}
+		roadmapFound := false
+		for _, path := range roadmapPaths {
+			content, err := fetchRawFile(repo, path)
+			if err == nil && content != "" {
+				// Truncate very long roadmaps
+				if len(content) > 3000 {
+					content = content[:3000] + "\n... (truncated)"
+				}
+				result.WriteString(fmt.Sprintf("(Source: %s)\n%s\n", path, content))
+				roadmapFound = true
+				break
+			}
+		}
+		if !roadmapFound {
+			result.WriteString("No roadmap file found in common locations (docs/references/roadmap.rst, docs/roadmap.md, ROADMAP.md)\n")
+		}
+	}
+
+	return mcp.NewToolResultText(result.String()), nil
+}
+
 func (s *Server) RunStdio() error {
 	return server.ServeStdio(s.mcpServer)
 }
@@ -984,6 +1184,19 @@ func (s *Server) handleJSONRPCRequest(request JSONRPCRequest) JSONRPCResponse {
 					"required": []string{"exec_id"},
 				},
 			},
+			{
+				"name":        "checkGitHubRelease",
+				"description": "Check a GitHub repository for new releases, release notes, and roadmap updates. Supports proxy via HTTP_PROXY/HTTPS_PROXY env vars and optional GITHUB_TOKEN for higher rate limits.",
+				"inputSchema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"repo":            map[string]interface{}{"type": "string", "description": "GitHub repository in owner/repo format (e.g., sgl-project/sglang)"},
+						"current_version": map[string]interface{}{"type": "string", "description": "Current version you have (e.g., v0.3.0). If provided, only shows newer releases."},
+						"include_roadmap": map[string]interface{}{"type": "boolean", "description": "Whether to fetch roadmap information (default: true)"},
+					},
+					"required": []string{"repo"},
+				},
+			},
 		}
 		return JSONRPCResponse{
 			JSONRPC: "2.0",
@@ -1051,6 +1264,8 @@ func (s *Server) handleJSONRPCRequest(request JSONRPCRequest) JSONRPCResponse {
 			result, err = s.handleExecContainer(ctx, req)
 		case "execContainerStatus":
 			result, err = s.handleExecContainerStatus(ctx, req)
+		case "checkGitHubRelease":
+			result, err = s.handleCheckGitHubRelease(ctx, req)
 		default:
 			return JSONRPCResponse{
 				JSONRPC: "2.0",

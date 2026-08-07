@@ -23,6 +23,10 @@ data:
   DOCKER_HOST: "unix:///var/run/docker.sock"
   # 方案二：TCP 代理模式（需要额外部署 docker-proxy）
   # DOCKER_HOST: "tcp://docker-proxy:2375"
+  # GitHub API 代理配置（checkGitHubRelease 工具需要访问 GitHub）
+  HTTP_PROXY: "http://your-proxy:8080"
+  HTTPS_PROXY: "http://your-proxy:8080"
+  NO_PROXY: "localhost,127.0.0.1"
 ---
 apiVersion: v1
 kind: Secret
@@ -34,6 +38,8 @@ stringData:
   # API Key，用于 Authorization Header 鉴权
   # 启动时通过 --api-key 或 MCP_API_KEY 环境变量设置
   api-key: ""
+  # GitHub Token（可选，用于提升 API 速率限制从 60次/小时 到 5000次/小时）
+  github-token: ""
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -71,6 +77,29 @@ spec:
                 secretKeyRef:
                   name: docker-mcp-auth
                   key: api-key
+                  optional: true
+            # GitHub API 代理配置（checkGitHubRelease 工具）
+            - name: HTTP_PROXY
+              valueFrom:
+                configMapKeyRef:
+                  name: docker-mcp-config
+                  key: HTTP_PROXY
+            - name: HTTPS_PROXY
+              valueFrom:
+                configMapKeyRef:
+                  name: docker-mcp-config
+                  key: HTTPS_PROXY
+            - name: NO_PROXY
+              valueFrom:
+                configMapKeyRef:
+                  name: docker-mcp-config
+                  key: NO_PROXY
+            # GitHub Token（可选，提升 API 速率限制）
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: docker-mcp-auth
+                  key: github-token
                   optional: true
           # 方案一：挂载 Docker socket（取消注释启用）
           volumeMounts:
