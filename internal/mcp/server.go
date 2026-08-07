@@ -479,6 +479,8 @@ func (s *Server) handleCreateComposeService(ctx context.Context, request mcp.Cal
 // allowedCommands defines the allowed command patterns for execContainer
 var allowedCommands = []string{
 	"modelscope",
+	"evalscope",
+	"git",
 	"docker pull",
 	"docker tag",
 	"docker login",
