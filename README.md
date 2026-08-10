@@ -9,10 +9,17 @@ Docker management tool based on Model Context Protocol (MCP), enabling AI agents
 | `createContainer` | 创建并启动 Docker 容器（带安全限制） |
 | `listContainers` | 获取所有容器列表 |
 | `listImages` | 获取所有镜像列表 |
+| `pullImage` | 拉取镜像（`detach=true` 可异步后台拉取） |
+| `tagImage` | 给镜像打新标签 |
+| `pushImage` | 推送镜像（`detach=true` 可异步后台推送） |
+| `loginToRegistry` | 登录镜像仓库 |
 | `getContainerLogs` | 获取容器日志 |
 | `inspectContainer` | 获取容器状态详情 |
 | `createComposeService` | 通过 docker-compose 启动服务 |
-| `execContainer` | 在运行中的容器内执行命令（带安全限制） |
+| `execContainer` | 在运行中的容器内执行命令（带安全限制，长任务自动 detach） |
+| `execContainerStatus` | 查询 detach 的 exec 命令状态 |
+| `imageTaskStatus` | 轮询异步拉取/推送任务状态与进度 |
+| `checkGitHubRelease` | 检查 GitHub 仓库 release / roadmap 更新 |
 
 ## 安全机制
 
@@ -247,6 +254,110 @@ execContainer(
   cmd="modelscope download --model Qwen/Qwen2.5-7B"
 )
 ```
+
+### 异步拉取/推送大镜像
+
+大镜像的拉取/推送耗时较长，`pullImage`/`pushImage` 支持 `detach=true` 异步执行：
+
+```bash
+# 1. 异步发起拉取，立即返回 task_id（不会阻塞等待）
+curl -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "tools/call",
+    "id": 1,
+    "params": {
+      "name": "pullImage",
+      "arguments": {"image": "pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime", "detach": true}
+    }
+  }'
+# 返回 Task ID: pull-xxx
+
+# 2. 轮询任务状态与进度
+curl -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "tools/call",
+    "id": 2,
+    "params": {
+      "name": "imageTaskStatus",
+      "arguments": {"task_id": "pull-xxx"}
+    }
+  }'
+```
+
+`imageTaskStatus` 返回示例：
+
+```
+Task ID: pull-xxx
+Type: pull
+Image: busybox:latest
+Status: completed
+Started: 2026-08-10T11:48:43+08:00
+Finished: 2026-08-10T11:48:50+08:00
+Recent progress:
+  latest: Pulling from library/busybox
+  025fe1949698: Downloading 753664/1915158 (39.4%)
+  025fe1949698: Pull complete
+  Status: Downloaded newer image for busybox:latest
+```
+
+> 说明：后台任务有 1 小时超时兜底；任务完成后保留 1 小时自动清理。Agent 提示词写法："用 pullImage 以 detach=true 异步拉取 `xxx:tag`，然后用 imageTaskStatus 轮询直到 completed，failed 则报告错误。"
+
+### 组合示例：检查 GitHub Release 后拉取最新版镜像
+
+结合 `checkGitHubRelease` 检查上游版本、再用 `pullImage` 拉取对应镜像：
+
+```bash
+# 1. 检查 sglang 的最新 release（可传 current_version 只返回更新的版本）
+curl -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "tools/call",
+    "id": 3,
+    "params": {
+      "name": "checkGitHubRelease",
+      "arguments": {
+        "repo": "sgl-project/sglang",
+        "current_version": "v0.3.0",
+        "include_roadmap": true
+      }
+    }
+  }'
+
+# 2. 根据返回的最新版本（如 v0.4.0），异步拉取对应镜像
+curl -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "tools/call",
+    "id": 4,
+    "params": {
+      "name": "pullImage",
+      "arguments": {"image": "lmsysorg/sglang:latest", "detach": true}
+    }
+  }'
+
+# 3. 轮询拉取进度
+curl -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "tools/call",
+    "id": 5,
+    "params": {
+      "name": "imageTaskStatus",
+      "arguments": {"task_id": "pull-xxx"}
+    }
+  }'
+```
+
+对应的 Agent 提示词（一步完成上面三个动作）：
+
+> 用 checkGitHubRelease 检查 `sgl-project/sglang` 的最新版本（我当前是 v0.3.0），把新版本的 release 说明总结给我；然后用 pullImage 以 detach=true 异步拉取对应的 `lmsysorg/sglang:latest` 镜像，并持续用 imageTaskStatus 轮询，直到任务 completed 或 failed。
 
 ## 项目结构
 

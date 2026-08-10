@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -48,7 +49,41 @@ type Server struct {
 	dockerClient *docker.DockerClient
 	composeSvc   *compose.ComposeService
 	mcpServer    *server.MCPServer
+
+	// Background image task management (async pull/push)
+	taskMu sync.Mutex
+	tasks  map[string]*imageTask
 }
+
+// imageTaskStatus represents the state of a background image task
+type imageTaskStatus string
+
+const (
+	taskRunning   imageTaskStatus = "running"
+	taskCompleted imageTaskStatus = "completed"
+	taskFailed    imageTaskStatus = "failed"
+)
+
+// imageTask tracks a background pull/push operation
+type imageTask struct {
+	ID         string
+	Type       string // "pull" or "push"
+	Image      string
+	Status     imageTaskStatus
+	Progress   []string // recent progress lines
+	Error      string
+	StartedAt  time.Time
+	FinishedAt time.Time
+}
+
+const (
+	// taskTimeout bounds how long a background pull/push may run before being aborted
+	taskTimeout = 1 * time.Hour
+	// taskTTL is how long finished tasks are kept before cleanup
+	taskTTL = 1 * time.Hour
+	// taskCleanupInterval is how often finished tasks are swept
+	taskCleanupInterval = 10 * time.Minute
+)
 
 func NewServer() (*Server, error) {
 	dockerClient, err := docker.NewDockerClient()
@@ -61,6 +96,7 @@ func NewServer() (*Server, error) {
 	s := &Server{
 		dockerClient: dockerClient,
 		composeSvc:   composeSvc,
+		tasks:        make(map[string]*imageTask),
 	}
 
 	s.mcpServer = server.NewMCPServer(
@@ -70,6 +106,10 @@ func NewServer() (*Server, error) {
 	)
 
 	s.registerTools()
+
+	// Start background cleanup of finished tasks
+	go s.cleanupTasks()
+
 	return s, nil
 }
 
@@ -114,10 +154,13 @@ func (s *Server) registerTools() {
 	// Pull Image tool
 	s.mcpServer.AddTool(
 		mcp.NewTool("pullImage",
-			mcp.WithDescription("Pull an image from registry"),
+			mcp.WithDescription("Pull an image from registry. Set detach=true for large images to run in background and poll with imageTaskStatus."),
 			mcp.WithString("image",
 				mcp.Required(),
 				mcp.Description("Image name to pull (e.g., nginx:latest, myregistry.com/myimage:tag)"),
+			),
+			mcp.WithBoolean("detach",
+				mcp.Description("Run in background and return a task ID immediately (default: false)"),
 			),
 		),
 		s.handlePullImage,
@@ -142,10 +185,13 @@ func (s *Server) registerTools() {
 	// Push Image tool
 	s.mcpServer.AddTool(
 		mcp.NewTool("pushImage",
-			mcp.WithDescription("Push an image to registry"),
+			mcp.WithDescription("Push an image to registry. Set detach=true for large images to run in background and poll with imageTaskStatus."),
 			mcp.WithString("image",
 				mcp.Required(),
 				mcp.Description("Image name to push (e.g., myregistry.com/myimage:tag)"),
+			),
+			mcp.WithBoolean("detach",
+				mcp.Description("Run in background and return a task ID immediately (default: false)"),
 			),
 		),
 		s.handlePushImage,
@@ -238,6 +284,18 @@ func (s *Server) registerTools() {
 			),
 		),
 		s.handleExecContainerStatus,
+	)
+
+	// imageTaskStatus tool for polling background pull/push task status
+	s.mcpServer.AddTool(
+		mcp.NewTool("imageTaskStatus",
+			mcp.WithDescription("Check the status and progress of a background image task started with pullImage or pushImage detach=true"),
+			mcp.WithString("task_id",
+				mcp.Required(),
+				mcp.Description("Task ID returned from pullImage/pushImage with detach=true"),
+			),
+		),
+		s.handleImageTaskStatus,
 	)
 
 	// checkGitHubRelease tool for checking GitHub repo releases and roadmap
@@ -362,6 +420,15 @@ func (s *Server) handlePullImage(ctx context.Context, request mcp.CallToolReques
 		return mcp.NewToolResultError("image is required"), nil
 	}
 
+	// Async mode: start background pull and return a task ID immediately
+	if request.GetBool("detach", false) {
+		taskID := s.startImageTask(ctx, "pull", image, func(taskCtx context.Context, task *imageTask) error {
+			return s.runPullTask(taskCtx, task, image)
+		})
+		return mcp.NewToolResultText(fmt.Sprintf(
+			"Image pull started in background.\nTask ID: %s\nUse imageTaskStatus with this task_id to check progress.", taskID)), nil
+	}
+
 	log.Printf("[INFO] Pulling image: %s", image)
 	err := s.dockerClient.PullImage(ctx, image)
 	if err != nil {
@@ -392,6 +459,15 @@ func (s *Server) handlePushImage(ctx context.Context, request mcp.CallToolReques
 	image := request.GetString("image", "")
 	if image == "" {
 		return mcp.NewToolResultError("image is required"), nil
+	}
+
+	// Async mode: start background push and return a task ID immediately
+	if request.GetBool("detach", false) {
+		taskID := s.startImageTask(ctx, "push", image, func(taskCtx context.Context, task *imageTask) error {
+			return s.runPushTask(taskCtx, task, image)
+		})
+		return mcp.NewToolResultText(fmt.Sprintf(
+			"Image push started in background.\nTask ID: %s\nUse imageTaskStatus with this task_id to check progress.", taskID)), nil
 	}
 
 	log.Printf("[INFO] Pushing image: %s", image)
@@ -717,6 +793,190 @@ func (s *Server) handleExecContainerStatus(ctx context.Context, request mcp.Call
 
 	output := fmt.Sprintf("Exec ID: %s\n%s", result.ExecID, result.Output)
 	return mcp.NewToolResultText(output), nil
+}
+
+// newTaskID generates a unique ID for a background image task
+func newTaskID(taskType string) string {
+	b := make([]byte, 4)
+	_, _ = rand.Read(b)
+	return fmt.Sprintf("%s-%x-%x", taskType, time.Now().UnixNano(), b)
+}
+
+// startImageTask registers a task, runs it in a background goroutine, and returns its ID.
+// The task is bounded by taskTimeout and kept for taskTTL after completion.
+func (s *Server) startImageTask(parent context.Context, taskType, image string, run func(ctx context.Context, task *imageTask) error) string {
+	task := &imageTask{
+		ID:        newTaskID(taskType),
+		Type:      taskType,
+		Image:     image,
+		Status:    taskRunning,
+		StartedAt: time.Now(),
+	}
+
+	s.taskMu.Lock()
+	s.tasks[task.ID] = task
+	s.taskMu.Unlock()
+
+	go func() {
+		taskCtx, cancel := context.WithTimeout(parent, taskTimeout)
+		defer cancel()
+
+		err := run(taskCtx, task)
+
+		s.taskMu.Lock()
+		defer s.taskMu.Unlock()
+		task.FinishedAt = time.Now()
+		if err != nil {
+			task.Status = taskFailed
+			task.Error = err.Error()
+		} else {
+			task.Status = taskCompleted
+		}
+		log.Printf("[INFO] image task %s (%s) finished: %s", task.Type, task.Image, task.Status)
+	}()
+
+	log.Printf("[INFO] image task started: id=%s type=%s image=%s", task.ID, task.Type, task.Image)
+	return task.ID
+}
+
+// cleanupTasks periodically removes finished tasks older than taskTTL
+func (s *Server) cleanupTasks() {
+	for {
+		time.Sleep(taskCleanupInterval)
+		s.taskMu.Lock()
+		now := time.Now()
+		for id, t := range s.tasks {
+			if t.Status != taskRunning && now.Sub(t.FinishedAt) > taskTTL {
+				delete(s.tasks, id)
+			}
+		}
+		s.taskMu.Unlock()
+	}
+}
+
+// runPullTask executes an image pull in the background, recording progress
+func (s *Server) runPullTask(ctx context.Context, task *imageTask, image string) error {
+	out, err := s.dockerClient.PullImageStream(ctx, image)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	return s.streamTaskProgress(task, out)
+}
+
+// runPushTask executes an image push in the background, recording progress
+func (s *Server) runPushTask(ctx context.Context, task *imageTask, image string) error {
+	out, err := s.dockerClient.PushImageStream(ctx, image)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	return s.streamTaskProgress(task, out)
+}
+
+// streamTaskProgress reads a pull/push progress stream and records recent lines into the task
+func (s *Server) streamTaskProgress(task *imageTask, r io.Reader) error {
+	dec := json.NewDecoder(r)
+	for {
+		var msg map[string]interface{}
+		if err := dec.Decode(&msg); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+		if errMsg, ok := msg["error"].(string); ok && errMsg != "" {
+			return fmt.Errorf("%s", errMsg)
+		}
+		if errDetail, ok := msg["errorDetail"].(map[string]interface{}); ok {
+			if m, ok := errDetail["message"].(string); ok && m != "" {
+				return fmt.Errorf("%s", m)
+			}
+		}
+		s.recordTaskProgress(task, msg)
+	}
+}
+
+// recordTaskProgress extracts status/progress from a stream message and stores it (capped)
+func (s *Server) recordTaskProgress(task *imageTask, msg map[string]interface{}) {
+	var line strings.Builder
+	if id, ok := msg["id"].(string); ok && id != "" {
+		line.WriteString(id)
+		line.WriteString(": ")
+	}
+	if status, ok := msg["status"].(string); ok {
+		line.WriteString(status)
+	}
+	if pd, ok := msg["progressDetail"].(map[string]interface{}); ok {
+		if cur, ok := pd["current"].(float64); ok {
+			if total, ok := pd["total"].(float64); ok && total > 0 {
+				line.WriteString(fmt.Sprintf(" %d/%d (%.1f%%)", int64(cur), int64(total), float64(cur)/float64(total)*100))
+			} else {
+				line.WriteString(fmt.Sprintf(" %d", int64(cur)))
+			}
+		}
+	}
+	if line.Len() == 0 {
+		return
+	}
+
+	s.taskMu.Lock()
+	defer s.taskMu.Unlock()
+	task.Progress = append(task.Progress, line.String())
+	if len(task.Progress) > 20 {
+		task.Progress = task.Progress[len(task.Progress)-20:]
+	}
+}
+
+// handleImageTaskStatus returns the status and progress of a background image task
+func (s *Server) handleImageTaskStatus(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	log.Printf("[INFO] handleImageTaskStatus called")
+	taskID := request.GetString("task_id", "")
+	if taskID == "" {
+		return mcp.NewToolResultError("task_id is required"), nil
+	}
+
+	s.taskMu.Lock()
+	task, ok := s.tasks[taskID]
+	if ok {
+		// Snapshot under lock to avoid data races
+		snapshot := &imageTask{
+			ID:         task.ID,
+			Type:       task.Type,
+			Image:      task.Image,
+			Status:     task.Status,
+			Progress:   append([]string(nil), task.Progress...),
+			Error:      task.Error,
+			StartedAt:  task.StartedAt,
+			FinishedAt: task.FinishedAt,
+		}
+		task = snapshot
+	}
+	s.taskMu.Unlock()
+
+	if !ok {
+		return mcp.NewToolResultText(fmt.Sprintf("Task %s not found (never created or already cleaned up)", taskID)), nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Task ID: %s\n", task.ID))
+	sb.WriteString(fmt.Sprintf("Type: %s\n", task.Type))
+	sb.WriteString(fmt.Sprintf("Image: %s\n", task.Image))
+	sb.WriteString(fmt.Sprintf("Status: %s\n", task.Status))
+	if task.Status != taskRunning {
+		sb.WriteString(fmt.Sprintf("Started: %s\n", task.StartedAt.Format(time.RFC3339)))
+		sb.WriteString(fmt.Sprintf("Finished: %s\n", task.FinishedAt.Format(time.RFC3339)))
+	}
+	if task.Error != "" {
+		sb.WriteString(fmt.Sprintf("Error: %s\n", task.Error))
+	}
+	if len(task.Progress) > 0 {
+		sb.WriteString("Recent progress:\n")
+		for _, l := range task.Progress {
+			sb.WriteString("  " + l + "\n")
+		}
+	}
+	return mcp.NewToolResultText(sb.String()), nil
 }
 
 // githubRelease represents a GitHub release from the API response
@@ -1080,11 +1340,12 @@ func (s *Server) handleJSONRPCRequest(request JSONRPCRequest) JSONRPCResponse {
 			},
 			{
 				"name":        "pullImage",
-				"description": "Pull an image from registry",
+				"description": "Pull an image from registry. Set detach=true for large images to run in background and poll with imageTaskStatus.",
 				"inputSchema": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
-						"image": map[string]interface{}{"type": "string", "description": "Image name to pull"},
+						"image":  map[string]interface{}{"type": "string", "description": "Image name to pull"},
+						"detach": map[string]interface{}{"type": "boolean", "description": "Run in background and return a task ID immediately (default: false)"},
 					},
 					"required": []string{"image"},
 				},
@@ -1103,11 +1364,12 @@ func (s *Server) handleJSONRPCRequest(request JSONRPCRequest) JSONRPCResponse {
 			},
 			{
 				"name":        "pushImage",
-				"description": "Push an image to registry",
+				"description": "Push an image to registry. Set detach=true for large images to run in background and poll with imageTaskStatus.",
 				"inputSchema": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
-						"image": map[string]interface{}{"type": "string", "description": "Image name to push"},
+						"image":  map[string]interface{}{"type": "string", "description": "Image name to push"},
+						"detach": map[string]interface{}{"type": "boolean", "description": "Run in background and return a task ID immediately (default: false)"},
 					},
 					"required": []string{"image"},
 				},
@@ -1182,6 +1444,17 @@ func (s *Server) handleJSONRPCRequest(request JSONRPCRequest) JSONRPCResponse {
 						"exec_id": map[string]interface{}{"type": "string", "description": "Exec ID returned from execContainer with detach=true"},
 					},
 					"required": []string{"exec_id"},
+				},
+			},
+			{
+				"name":        "imageTaskStatus",
+				"description": "Check the status and progress of a background image task started with pullImage or pushImage detach=true",
+				"inputSchema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"task_id": map[string]interface{}{"type": "string", "description": "Task ID returned from pullImage/pushImage with detach=true"},
+					},
+					"required": []string{"task_id"},
 				},
 			},
 			{
@@ -1264,6 +1537,8 @@ func (s *Server) handleJSONRPCRequest(request JSONRPCRequest) JSONRPCResponse {
 			result, err = s.handleExecContainer(ctx, req)
 		case "execContainerStatus":
 			result, err = s.handleExecContainerStatus(ctx, req)
+		case "imageTaskStatus":
+			result, err = s.handleImageTaskStatus(ctx, req)
 		case "checkGitHubRelease":
 			result, err = s.handleCheckGitHubRelease(ctx, req)
 		default:

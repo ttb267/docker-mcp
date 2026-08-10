@@ -236,6 +236,24 @@ func (d *DockerClient) PushImage(ctx context.Context, imageName string) error {
 	return err
 }
 
+// PullImageStream starts pulling an image and returns the progress stream reader
+func (d *DockerClient) PullImageStream(ctx context.Context, imageName string) (io.ReadCloser, error) {
+	out, err := d.cli.ImagePull(ctx, imageName, image.PullOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to pull image: %w", err)
+	}
+	return out, nil
+}
+
+// PushImageStream starts pushing an image and returns the progress stream reader
+func (d *DockerClient) PushImageStream(ctx context.Context, imageName string) (io.ReadCloser, error) {
+	out, err := d.cli.ImagePush(ctx, imageName, image.PushOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to push image: %w", err)
+	}
+	return out, nil
+}
+
 // ExecResult contains the result of executing a command in a container
 type ExecResult struct {
 	ExecID   string
