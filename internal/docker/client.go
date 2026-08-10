@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
+	"github.com/distribution/reference"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
@@ -19,6 +22,12 @@ import (
 
 type DockerClient struct {
 	cli *dockerclient.Client
+
+	// Credentials stored by loginToRegistry, keyed by normalized registry hostname.
+	// The docker SDK's ImagePush/ImagePull do NOT read the docker config file,
+	// so we must pass auth explicitly via RegistryAuth.
+	mu    sync.RWMutex
+	auths map[string]registry.AuthConfig
 }
 
 type ContainerConfig struct {
@@ -44,7 +53,7 @@ func NewDockerClient() (*DockerClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Docker client: %w", err)
 	}
-	return &DockerClient{cli: cli}, nil
+	return &DockerClient{cli: cli, auths: make(map[string]registry.AuthConfig)}, nil
 }
 
 func (d *DockerClient) Close() error {
@@ -186,7 +195,7 @@ func (d *DockerClient) ListImages(ctx context.Context) ([]ImageInfo, error) {
 
 // PullImage pulls an image from registry
 func (d *DockerClient) PullImage(ctx context.Context, imageName string) error {
-	out, err := d.cli.ImagePull(ctx, imageName, image.PullOptions{})
+	out, err := d.cli.ImagePull(ctx, imageName, image.PullOptions{RegistryAuth: d.registryAuthHeader(imageName)})
 	if err != nil {
 		return fmt.Errorf("failed to pull image: %w", err)
 	}
@@ -206,7 +215,7 @@ func (d *DockerClient) TagImage(ctx context.Context, source, target string) erro
 	return nil
 }
 
-// LoginToRegistry logs in to a registry
+// LoginToRegistry logs in to a registry and persists credentials for later push/pull
 func (d *DockerClient) LoginToRegistry(ctx context.Context, registryAddr, username, password string) error {
 	authConfig := registry.AuthConfig{
 		Username:      username,
@@ -219,13 +228,67 @@ func (d *DockerClient) LoginToRegistry(ctx context.Context, registryAddr, userna
 		return fmt.Errorf("login failed: %w", err)
 	}
 
+	// Persist credentials so subsequent push/pull can pass them via RegistryAuth
+	d.mu.Lock()
+	d.auths[normalizeRegistry(registryAddr)] = authConfig
+	d.mu.Unlock()
+
 	fmt.Printf("Login successful: %s\n", response.Status)
 	return nil
 }
 
+// normalizeRegistry reduces a registry address to its canonical hostname.
+// Docker Hub has several aliases, all normalized to "docker.io".
+func normalizeRegistry(addr string) string {
+	addr = strings.TrimSpace(addr)
+	addr = strings.ToLower(addr)
+	if i := strings.Index(addr, "://"); i >= 0 {
+		addr = addr[i+3:]
+	}
+	if i := strings.Index(addr, "/"); i >= 0 {
+		addr = addr[:i]
+	}
+	switch addr {
+	case "index.docker.io", "registry-1.docker.io", "registry.hub.docker.com":
+		return "docker.io"
+	}
+	return addr
+}
+
+// authConfigForImage returns the stored auth config for the image's registry
+func (d *DockerClient) authConfigForImage(imageName string) registry.AuthConfig {
+	domain := ""
+	if ref, err := reference.ParseNormalizedNamed(imageName); err == nil {
+		domain = normalizeRegistry(reference.Domain(ref))
+	}
+
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if domain != "" {
+		if ac, ok := d.auths[domain]; ok {
+			return ac
+		}
+	}
+	return registry.AuthConfig{}
+}
+
+// registryAuthHeader returns the base64-encoded X-Registry-Auth value for an image.
+// Empty string means no stored credentials (anonymous pull/push).
+func (d *DockerClient) registryAuthHeader(imageName string) string {
+	ac := d.authConfigForImage(imageName)
+	if ac.Username == "" && ac.Password == "" {
+		return ""
+	}
+	enc, err := registry.EncodeAuthConfig(ac)
+	if err != nil {
+		return ""
+	}
+	return enc
+}
+
 // PushImage pushes an image to registry
 func (d *DockerClient) PushImage(ctx context.Context, imageName string) error {
-	out, err := d.cli.ImagePush(ctx, imageName, image.PushOptions{})
+	out, err := d.cli.ImagePush(ctx, imageName, image.PushOptions{RegistryAuth: d.registryAuthHeader(imageName)})
 	if err != nil {
 		return fmt.Errorf("failed to push image: %w", err)
 	}
@@ -238,7 +301,7 @@ func (d *DockerClient) PushImage(ctx context.Context, imageName string) error {
 
 // PullImageStream starts pulling an image and returns the progress stream reader
 func (d *DockerClient) PullImageStream(ctx context.Context, imageName string) (io.ReadCloser, error) {
-	out, err := d.cli.ImagePull(ctx, imageName, image.PullOptions{})
+	out, err := d.cli.ImagePull(ctx, imageName, image.PullOptions{RegistryAuth: d.registryAuthHeader(imageName)})
 	if err != nil {
 		return nil, fmt.Errorf("failed to pull image: %w", err)
 	}
@@ -247,7 +310,7 @@ func (d *DockerClient) PullImageStream(ctx context.Context, imageName string) (i
 
 // PushImageStream starts pushing an image and returns the progress stream reader
 func (d *DockerClient) PushImageStream(ctx context.Context, imageName string) (io.ReadCloser, error) {
-	out, err := d.cli.ImagePush(ctx, imageName, image.PushOptions{})
+	out, err := d.cli.ImagePush(ctx, imageName, image.PushOptions{RegistryAuth: d.registryAuthHeader(imageName)})
 	if err != nil {
 		return nil, fmt.Errorf("failed to push image: %w", err)
 	}
