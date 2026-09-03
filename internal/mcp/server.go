@@ -50,9 +50,13 @@ type Server struct {
 	composeSvc   *compose.ComposeService
 	mcpServer    *server.MCPServer
 
-	// Background image task management (async pull/push)
+	// Background image task management (async pull/push/load)
 	taskMu sync.Mutex
 	tasks  map[string]*imageTask
+
+	// Background exec task management (async exec commands)
+	execTaskMu sync.Mutex
+	execTasks  map[string]*execTask
 }
 
 // imageTaskStatus represents the state of a background image task
@@ -62,18 +66,31 @@ const (
 	taskRunning   imageTaskStatus = "running"
 	taskCompleted imageTaskStatus = "completed"
 	taskFailed    imageTaskStatus = "failed"
+	taskStopped   imageTaskStatus = "stopped"
 )
 
 // imageTask tracks a background pull/push operation
 type imageTask struct {
 	ID         string
-	Type       string // "pull" or "push"
+	Type       string // "pull", "push", or "load"
 	Image      string
 	Status     imageTaskStatus
 	Progress   []string // recent progress lines
 	Error      string
 	StartedAt  time.Time
 	FinishedAt time.Time
+}
+
+// execTask tracks a background exec command (e.g. modelscope download)
+type execTask struct {
+	ExecID      string
+	ContainerID string
+	Cmd         string
+	Status      imageTaskStatus
+	Output      []string // recent output chunks
+	Error       string
+	StartedAt   time.Time
+	FinishedAt  time.Time
 }
 
 const (
@@ -97,6 +114,7 @@ func NewServer() (*Server, error) {
 		dockerClient: dockerClient,
 		composeSvc:   composeSvc,
 		tasks:        make(map[string]*imageTask),
+		execTasks:    make(map[string]*execTask),
 	}
 
 	s.mcpServer = server.NewMCPServer(
@@ -154,10 +172,13 @@ func (s *Server) registerTools() {
 	// Pull Image tool
 	s.mcpServer.AddTool(
 		mcp.NewTool("pullImage",
-			mcp.WithDescription("Pull an image from registry. Set detach=true for large images to run in background and poll with imageTaskStatus."),
+			mcp.WithDescription("Pull an image from registry. Set detach=true for large images to run in background and poll with imageTaskStatus. Use platform to pull a specific architecture (e.g., linux/amd64, linux/arm64)."),
 			mcp.WithString("image",
 				mcp.Required(),
 				mcp.Description("Image name to pull (e.g., nginx:latest, myregistry.com/myimage:tag)"),
+			),
+			mcp.WithString("platform",
+				mcp.Description("Target platform for the image (e.g., linux/amd64, linux/arm64). Shorthand: amd64/x86_64/arm64/aarch64 also accepted. Empty = host default."),
 			),
 			mcp.WithBoolean("detach",
 				mcp.Description("Run in background and return a task ID immediately (default: false)"),
@@ -258,7 +279,7 @@ func (s *Server) registerTools() {
 
 	s.mcpServer.AddTool(
 		mcp.NewTool("execContainer",
-			mcp.WithDescription("Execute a command in a running container. Long-running commands (modelscope, wget, curl, download, etc.) will auto-stream output."),
+			mcp.WithDescription("Execute a command in a running container. Long-running commands (modelscope, wget, curl, download, etc.) will auto-detach and return an exec_id immediately. Use execContainerStatus to check progress and stopExecCommand to stop."),
 			mcp.WithString("container_id",
 				mcp.Required(),
 				mcp.Description("Container ID or name"),
@@ -269,6 +290,9 @@ func (s *Server) registerTools() {
 			),
 			mcp.WithString("env",
 				mcp.Description("Environment variables (e.g., HTTP_PROXY=http://proxy:8080)"),
+			),
+			mcp.WithBoolean("detach",
+				mcp.Description("Run in background and return exec_id immediately (default: false). Long-running commands auto-detach."),
 			),
 		),
 		s.handleExecContainer,
@@ -286,16 +310,47 @@ func (s *Server) registerTools() {
 		s.handleExecContainerStatus,
 	)
 
-	// imageTaskStatus tool for polling background pull/push task status
+	// imageTaskStatus tool for polling background pull/push/load task status
 	s.mcpServer.AddTool(
 		mcp.NewTool("imageTaskStatus",
-			mcp.WithDescription("Check the status and progress of a background image task started with pullImage or pushImage detach=true"),
+			mcp.WithDescription("Check the status and progress of a background image task started with pullImage, pushImage, or loadImageFromTar with detach=true"),
 			mcp.WithString("task_id",
 				mcp.Required(),
-				mcp.Description("Task ID returned from pullImage/pushImage with detach=true"),
+				mcp.Description("Task ID returned from pullImage/pushImage/loadImageFromTar with detach=true"),
 			),
 		),
 		s.handleImageTaskStatus,
+	)
+
+	// stopExecCommand tool for stopping a running background exec command
+	s.mcpServer.AddTool(
+		mcp.NewTool("stopExecCommand",
+			mcp.WithDescription("Stop a running background exec command (e.g., modelscope download). Useful for interrupting a model download to free bandwidth. modelscope supports resume, so the download can be restarted later."),
+			mcp.WithString("exec_id",
+				mcp.Required(),
+				mcp.Description("Exec ID returned from execContainer with detach=true"),
+			),
+		),
+		s.handleStopExecCommand,
+	)
+
+	// loadImageFromTar tool: download tar, docker load, tag, and push
+	s.mcpServer.AddTool(
+		mcp.NewTool("loadImageFromTar",
+			mcp.WithDescription("Download a Docker image tar from a URL, load it with docker load, tag it, and push to a target registry. Supports detach=true for large images."),
+			mcp.WithString("tar_url",
+				mcp.Required(),
+				mcp.Description("URL to download the image tar file from"),
+			),
+			mcp.WithString("target_image",
+				mcp.Required(),
+				mcp.Description("Target image name:tag (e.g., myregistry.com/myimage:v1.0)"),
+			),
+			mcp.WithBoolean("detach",
+				mcp.Description("Run in background and return a task ID immediately (default: false)"),
+			),
+		),
+		s.handleLoadImageFromTar,
 	)
 
 	// checkGitHubRelease tool for checking GitHub repo releases and roadmap
@@ -420,22 +475,31 @@ func (s *Server) handlePullImage(ctx context.Context, request mcp.CallToolReques
 		return mcp.NewToolResultError("image is required"), nil
 	}
 
+	platform := normalizePlatform(request.GetString("platform", ""))
+
 	// Async mode: start background pull and return a task ID immediately
 	if request.GetBool("detach", false) {
 		taskID := s.startImageTask(ctx, "pull", image, func(taskCtx context.Context, task *imageTask) error {
-			return s.runPullTask(taskCtx, task, image)
+			return s.runPullTask(taskCtx, task, image, platform)
 		})
-		return mcp.NewToolResultText(fmt.Sprintf(
-			"Image pull started in background.\nTask ID: %s\nUse imageTaskStatus with this task_id to check progress.", taskID)), nil
+		desc := fmt.Sprintf("Image pull started in background.\nTask ID: %s\nUse imageTaskStatus with this task_id to check progress.", taskID)
+		if platform != "" {
+			desc = fmt.Sprintf("Image pull started in background (platform: %s).\nTask ID: %s\nUse imageTaskStatus with this task_id to check progress.", platform, taskID)
+		}
+		return mcp.NewToolResultText(desc), nil
 	}
 
-	log.Printf("[INFO] Pulling image: %s", image)
-	err := s.dockerClient.PullImage(ctx, image)
+	log.Printf("[INFO] Pulling image: %s, platform: %s", image, platform)
+	err := s.dockerClient.PullImage(ctx, image, platform)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to pull image: %v", err)), nil
 	}
 
-	return mcp.NewToolResultText(fmt.Sprintf("Image pulled successfully: %s", image)), nil
+	result := fmt.Sprintf("Image pulled successfully: %s", image)
+	if platform != "" {
+		result = fmt.Sprintf("Image pulled successfully: %s (platform: %s)", image, platform)
+	}
+	return mcp.NewToolResultText(result), nil
 }
 
 func (s *Server) handleTagImage(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -756,7 +820,6 @@ func (s *Server) handleExecContainer(ctx context.Context, request mcp.CallToolRe
 	}
 
 	// Get optional detach parameter (default: false)
-	// Get optional detach parameter (default: false)
 	userDetach := request.GetBool("detach", false)
 
 	// Auto-detach for long-running commands
@@ -770,7 +833,63 @@ func (s *Server) handleExecContainer(ctx context.Context, request mcp.CallToolRe
 	// Split command string into slice (by whitespace, not comma)
 	cmd := strings.Fields(cmdStr)
 
-	result, err := s.dockerClient.ExecContainer(ctx, containerID, cmd, env, detach)
+	// Detach mode: start exec in background and return exec_id immediately
+	if detach {
+		execID, err := s.dockerClient.ExecContainerStart(ctx, containerID, cmd, env)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to start exec: %v", err)), nil
+		}
+
+		// Track the exec task
+		task := &execTask{
+			ExecID:      execID,
+			ContainerID: containerID,
+			Cmd:         cmdStr,
+			Status:      taskRunning,
+			StartedAt:   time.Now(),
+		}
+		s.execTaskMu.Lock()
+		s.execTasks[execID] = task
+		s.execTaskMu.Unlock()
+
+		// Background goroutine: attach and capture output
+		go func() {
+			bgCtx := context.Background()
+			err := s.dockerClient.ExecContainerStream(bgCtx, execID, func(chunk string) {
+				s.execTaskMu.Lock()
+				task.Output = append(task.Output, chunk)
+				if len(task.Output) > 50 {
+					task.Output = task.Output[len(task.Output)-50:]
+				}
+				s.execTaskMu.Unlock()
+			})
+
+			// Update task status (don't overwrite if already stopped by user)
+			exitCode, _ := s.dockerClient.GetExecExitCode(bgCtx, execID)
+			s.execTaskMu.Lock()
+			if task.Status == taskRunning {
+				task.FinishedAt = time.Now()
+				if err != nil {
+					task.Status = taskFailed
+					task.Error = err.Error()
+				} else if exitCode != 0 {
+					task.Status = taskFailed
+					task.Error = fmt.Sprintf("exit code: %d", exitCode)
+				} else {
+					task.Status = taskCompleted
+				}
+			}
+			s.execTaskMu.Unlock()
+			log.Printf("[INFO] exec task %s finished: %s", execID, task.Status)
+		}()
+
+		return mcp.NewToolResultText(fmt.Sprintf(
+			"Command started in background.\nExec ID: %s\nCommand: %s\nUse execContainerStatus with this exec_id to check progress.\nUse stopExecCommand with this exec_id to stop the command.",
+			execID, cmdStr)), nil
+	}
+
+	// Synchronous mode: run and wait for result
+	result, err := s.dockerClient.ExecContainer(ctx, containerID, cmd, env, false)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to exec in container: %v", err)), nil
 	}
@@ -786,6 +905,46 @@ func (s *Server) handleExecContainerStatus(ctx context.Context, request mcp.Call
 		return mcp.NewToolResultError("exec_id is required. Use the Exec ID returned from execContainer with detach=true"), nil
 	}
 
+	// Check local execTasks first (for async-detached commands)
+	s.execTaskMu.Lock()
+	task, ok := s.execTasks[execID]
+	if ok {
+		snapshot := &execTask{
+			ExecID:      task.ExecID,
+			ContainerID: task.ContainerID,
+			Cmd:         task.Cmd,
+			Status:      task.Status,
+			Output:      append([]string(nil), task.Output...),
+			Error:       task.Error,
+			StartedAt:   task.StartedAt,
+			FinishedAt:  task.FinishedAt,
+		}
+		s.execTaskMu.Unlock()
+
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("Exec ID: %s\n", snapshot.ExecID))
+		sb.WriteString(fmt.Sprintf("Command: %s\n", snapshot.Cmd))
+		sb.WriteString(fmt.Sprintf("Status: %s\n", snapshot.Status))
+		if !snapshot.StartedAt.IsZero() {
+			sb.WriteString(fmt.Sprintf("Started: %s\n", snapshot.StartedAt.Format(time.RFC3339)))
+		}
+		if snapshot.Status != taskRunning && !snapshot.FinishedAt.IsZero() {
+			sb.WriteString(fmt.Sprintf("Finished: %s\n", snapshot.FinishedAt.Format(time.RFC3339)))
+		}
+		if snapshot.Error != "" {
+			sb.WriteString(fmt.Sprintf("Error: %s\n", snapshot.Error))
+		}
+		if len(snapshot.Output) > 0 {
+			sb.WriteString("Output:\n")
+			for _, chunk := range snapshot.Output {
+				sb.WriteString(chunk)
+			}
+		}
+		return mcp.NewToolResultText(sb.String()), nil
+	}
+	s.execTaskMu.Unlock()
+
+	// Fall back to Docker API (for execs started without tracking)
 	result, err := s.dockerClient.ExecContainerStatus(ctx, execID)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to get exec status: %v", err)), nil
@@ -843,20 +1002,58 @@ func (s *Server) startImageTask(parent context.Context, taskType, image string, 
 func (s *Server) cleanupTasks() {
 	for {
 		time.Sleep(taskCleanupInterval)
-		s.taskMu.Lock()
 		now := time.Now()
+
+		s.taskMu.Lock()
 		for id, t := range s.tasks {
 			if t.Status != taskRunning && now.Sub(t.FinishedAt) > taskTTL {
 				delete(s.tasks, id)
 			}
 		}
 		s.taskMu.Unlock()
+
+		s.execTaskMu.Lock()
+		for id, t := range s.execTasks {
+			if t.Status != taskRunning && now.Sub(t.FinishedAt) > taskTTL {
+				delete(s.execTasks, id)
+			}
+		}
+		s.execTaskMu.Unlock()
+	}
+}
+
+// normalizePlatform converts shorthand architecture names to full platform strings.
+// "amd64", "x86_64", "x86" → "linux/amd64"
+// "arm64", "aarch64", "arm" → "linux/arm64"
+// Already-qualified platforms like "linux/amd64" are returned as-is.
+// Empty input returns empty string (use host default).
+func normalizePlatform(input string) string {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return ""
+	}
+	// Already a full platform (e.g., "linux/amd64")
+	if strings.Contains(input, "/") {
+		return input
+	}
+	// Normalize architecture shorthand
+	switch strings.ToLower(input) {
+	case "amd64", "x86_64", "x86", "x64":
+		return "linux/amd64"
+	case "arm64", "aarch64", "arm":
+		return "linux/arm64"
+	case "386", "i386":
+		return "linux/386"
+	case "armv7", "armv7l", "armhf":
+		return "linux/arm/v7"
+	default:
+		return "linux/" + strings.ToLower(input)
 	}
 }
 
 // runPullTask executes an image pull in the background, recording progress
-func (s *Server) runPullTask(ctx context.Context, task *imageTask, image string) error {
-	out, err := s.dockerClient.PullImageStream(ctx, image)
+func (s *Server) runPullTask(ctx context.Context, task *imageTask, image, platform string) error {
+	out, err := s.dockerClient.PullImageStream(ctx, image, platform)
 	if err != nil {
 		return err
 	}
@@ -977,6 +1174,171 @@ func (s *Server) handleImageTaskStatus(ctx context.Context, request mcp.CallTool
 		}
 	}
 	return mcp.NewToolResultText(sb.String()), nil
+}
+
+// handleStopExecCommand stops a running background exec command
+func (s *Server) handleStopExecCommand(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	log.Printf("[INFO] handleStopExecCommand called")
+	execID := request.GetString("exec_id", "")
+	if execID == "" {
+		return mcp.NewToolResultError("exec_id is required"), nil
+	}
+
+	s.execTaskMu.Lock()
+	task, ok := s.execTasks[execID]
+	if !ok {
+		s.execTaskMu.Unlock()
+		return mcp.NewToolResultError(fmt.Sprintf("Exec task %s not found (not tracked or already cleaned up)", execID)), nil
+	}
+
+	if task.Status != taskRunning {
+		status := task.Status
+		s.execTaskMu.Unlock()
+		return mcp.NewToolResultText(fmt.Sprintf("Exec %s is not running (status: %s)", execID, status)), nil
+	}
+
+	containerID := task.ContainerID
+	cmdPattern := task.Cmd
+	s.execTaskMu.Unlock()
+
+	// Kill the process in the container
+	log.Printf("[INFO] Stopping exec %s in container %s, pattern: %s", execID, containerID, cmdPattern)
+	err := s.dockerClient.KillProcessInContainer(ctx, containerID, cmdPattern)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to stop command: %v", err)), nil
+	}
+
+	// Update task status
+	s.execTaskMu.Lock()
+	if task.Status == taskRunning {
+		task.Status = taskStopped
+		task.FinishedAt = time.Now()
+	}
+	s.execTaskMu.Unlock()
+
+	return mcp.NewToolResultText(fmt.Sprintf(
+		"Command stopped successfully.\nExec ID: %s\nCommand: %s\nNote: modelscope supports resume, you can restart the download later.",
+		execID, cmdPattern)), nil
+}
+
+// downloadFile downloads a file from a URL to a temporary file and returns its path.
+// The caller is responsible for removing the temp file when done.
+func downloadFile(url string) (string, error) {
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+		},
+	}
+
+	resp, err := client.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("failed to download file: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("download failed with status %d", resp.StatusCode)
+	}
+
+	tmpFile, err := os.CreateTemp("", "docker-image-*.tar")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp file: %w", err)
+	}
+
+	_, err = io.Copy(tmpFile, resp.Body)
+	tmpFile.Close()
+	if err != nil {
+		os.Remove(tmpFile.Name())
+		return "", fmt.Errorf("failed to write temp file: %w", err)
+	}
+
+	return tmpFile.Name(), nil
+}
+
+// runLoadTask executes download+load+tag+push in the background, recording progress
+func (s *Server) runLoadTask(ctx context.Context, task *imageTask, tarURL, targetImage string) error {
+	// Step 1: Download tar file
+	s.recordTaskProgress(task, map[string]interface{}{"status": "Downloading tar from " + tarURL})
+	tarPath, err := downloadFile(tarURL)
+	if err != nil {
+		return fmt.Errorf("download failed: %w", err)
+	}
+	defer os.Remove(tarPath)
+	s.recordTaskProgress(task, map[string]interface{}{"status": "Download complete"})
+
+	// Step 2: Load image from tar
+	s.recordTaskProgress(task, map[string]interface{}{"status": "Loading image from tar..."})
+	loadedImage, err := s.dockerClient.LoadImage(ctx, tarPath)
+	if err != nil {
+		return fmt.Errorf("load failed: %w", err)
+	}
+	s.recordTaskProgress(task, map[string]interface{}{"status": "Loaded image: " + loadedImage})
+
+	// Step 3: Tag the loaded image
+	s.recordTaskProgress(task, map[string]interface{}{"status": "Tagging as " + targetImage})
+	err = s.dockerClient.TagImage(ctx, loadedImage, targetImage)
+	if err != nil {
+		return fmt.Errorf("tag failed: %w", err)
+	}
+	s.recordTaskProgress(task, map[string]interface{}{"status": "Tagged successfully"})
+
+	// Step 4: Push the tagged image
+	s.recordTaskProgress(task, map[string]interface{}{"status": "Pushing " + targetImage})
+	out, err := s.dockerClient.PushImageStream(ctx, targetImage)
+	if err != nil {
+		return fmt.Errorf("push failed: %w", err)
+	}
+	defer out.Close()
+	return s.streamTaskProgress(task, out)
+}
+
+// handleLoadImageFromTar downloads a tar, loads it, tags it, and pushes to registry
+func (s *Server) handleLoadImageFromTar(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	log.Printf("[INFO] handleLoadImageFromTar called")
+	tarURL := request.GetString("tar_url", "")
+	if tarURL == "" {
+		return mcp.NewToolResultError("tar_url is required"), nil
+	}
+
+	targetImage := request.GetString("target_image", "")
+	if targetImage == "" {
+		return mcp.NewToolResultError("target_image is required"), nil
+	}
+
+	// Async mode: start background task and return task ID immediately
+	if request.GetBool("detach", false) {
+		taskID := s.startImageTask(ctx, "load", targetImage, func(taskCtx context.Context, task *imageTask) error {
+			return s.runLoadTask(taskCtx, task, tarURL, targetImage)
+		})
+		return mcp.NewToolResultText(fmt.Sprintf(
+			"Image load started in background.\nTask ID: %s\nUse imageTaskStatus with this task_id to check progress.", taskID)), nil
+	}
+
+	// Synchronous mode: download, load, tag, push
+	tarPath, err := downloadFile(tarURL)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Download failed: %v", err)), nil
+	}
+	defer os.Remove(tarPath)
+
+	loadedImage, err := s.dockerClient.LoadImage(ctx, tarPath)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Load failed: %v", err)), nil
+	}
+
+	err = s.dockerClient.TagImage(ctx, loadedImage, targetImage)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Tag failed: %v", err)), nil
+	}
+
+	err = s.dockerClient.PushImage(ctx, targetImage)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Push failed: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(fmt.Sprintf(
+		"Image loaded and pushed successfully.\nLoaded: %s\nTagged as: %s\nPushed to: %s",
+		loadedImage, targetImage, targetImage)), nil
 }
 
 // githubRelease represents a GitHub release from the API response
@@ -1340,12 +1702,13 @@ func (s *Server) handleJSONRPCRequest(request JSONRPCRequest) JSONRPCResponse {
 			},
 			{
 				"name":        "pullImage",
-				"description": "Pull an image from registry. Set detach=true for large images to run in background and poll with imageTaskStatus.",
+				"description": "Pull an image from registry. Set detach=true for large images to run in background and poll with imageTaskStatus. Use platform to pull a specific architecture (e.g., linux/amd64, linux/arm64).",
 				"inputSchema": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
-						"image":  map[string]interface{}{"type": "string", "description": "Image name to pull"},
-						"detach": map[string]interface{}{"type": "boolean", "description": "Run in background and return a task ID immediately (default: false)"},
+						"image":    map[string]interface{}{"type": "string", "description": "Image name to pull"},
+						"platform": map[string]interface{}{"type": "string", "description": "Target platform (e.g., linux/amd64, linux/arm64). Shorthand: amd64/x86_64/arm64/aarch64 also accepted. Empty = host default."},
+						"detach":   map[string]interface{}{"type": "boolean", "description": "Run in background and return a task ID immediately (default: false)"},
 					},
 					"required": []string{"image"},
 				},
@@ -1424,13 +1787,14 @@ func (s *Server) handleJSONRPCRequest(request JSONRPCRequest) JSONRPCResponse {
 			},
 			{
 				"name":        "execContainer",
-				"description": "Execute a command in a running container. Long-running commands (modelscope, wget, curl, download, etc.) will auto-stream output.",
+				"description": "Execute a command in a running container. Long-running commands (modelscope, wget, curl, download, etc.) will auto-detach and return an exec_id immediately. Use execContainerStatus to check progress and stopExecCommand to stop.",
 				"inputSchema": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
 						"container_id": map[string]interface{}{"type": "string", "description": "Container ID or name"},
 						"cmd":          map[string]interface{}{"type": "string", "description": "Command to execute"},
 						"env":          map[string]interface{}{"type": "string", "description": "Environment variables (e.g., HTTP_PROXY=http://proxy:8080)"},
+						"detach":       map[string]interface{}{"type": "boolean", "description": "Run in background and return exec_id immediately (default: false). Long-running commands auto-detach."},
 					},
 					"required": []string{"container_id", "cmd"},
 				},
@@ -1448,13 +1812,37 @@ func (s *Server) handleJSONRPCRequest(request JSONRPCRequest) JSONRPCResponse {
 			},
 			{
 				"name":        "imageTaskStatus",
-				"description": "Check the status and progress of a background image task started with pullImage or pushImage detach=true",
+				"description": "Check the status and progress of a background image task started with pullImage, pushImage, or loadImageFromTar with detach=true",
 				"inputSchema": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
-						"task_id": map[string]interface{}{"type": "string", "description": "Task ID returned from pullImage/pushImage with detach=true"},
+						"task_id": map[string]interface{}{"type": "string", "description": "Task ID returned from pullImage/pushImage/loadImageFromTar with detach=true"},
 					},
 					"required": []string{"task_id"},
+				},
+			},
+			{
+				"name":        "stopExecCommand",
+				"description": "Stop a running background exec command (e.g., modelscope download). Useful for interrupting a model download to free bandwidth. modelscope supports resume, so the download can be restarted later.",
+				"inputSchema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"exec_id": map[string]interface{}{"type": "string", "description": "Exec ID returned from execContainer with detach=true"},
+					},
+					"required": []string{"exec_id"},
+				},
+			},
+			{
+				"name":        "loadImageFromTar",
+				"description": "Download a Docker image tar from a URL, load it with docker load, tag it, and push to a target registry. Supports detach=true for large images.",
+				"inputSchema": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"tar_url":      map[string]interface{}{"type": "string", "description": "URL to download the image tar file from"},
+						"target_image": map[string]interface{}{"type": "string", "description": "Target image name:tag (e.g., myregistry.com/myimage:v1.0)"},
+						"detach":       map[string]interface{}{"type": "boolean", "description": "Run in background and return a task ID immediately (default: false)"},
+					},
+					"required": []string{"tar_url", "target_image"},
 				},
 			},
 			{
@@ -1539,6 +1927,10 @@ func (s *Server) handleJSONRPCRequest(request JSONRPCRequest) JSONRPCResponse {
 			result, err = s.handleExecContainerStatus(ctx, req)
 		case "imageTaskStatus":
 			result, err = s.handleImageTaskStatus(ctx, req)
+		case "stopExecCommand":
+			result, err = s.handleStopExecCommand(ctx, req)
+		case "loadImageFromTar":
+			result, err = s.handleLoadImageFromTar(ctx, req)
 		case "checkGitHubRelease":
 			result, err = s.handleCheckGitHubRelease(ctx, req)
 		default:

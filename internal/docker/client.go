@@ -3,6 +3,7 @@ package docker
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -193,9 +194,13 @@ func (d *DockerClient) ListImages(ctx context.Context) ([]ImageInfo, error) {
 	return result, nil
 }
 
-// PullImage pulls an image from registry
-func (d *DockerClient) PullImage(ctx context.Context, imageName string) error {
-	out, err := d.cli.ImagePull(ctx, imageName, image.PullOptions{RegistryAuth: d.registryAuthHeader(imageName)})
+// PullImage pulls an image from registry. platform specifies the target platform
+// (e.g., "linux/amd64", "linux/arm64"). Empty string means use default platform.
+func (d *DockerClient) PullImage(ctx context.Context, imageName, platform string) error {
+	out, err := d.cli.ImagePull(ctx, imageName, image.PullOptions{
+		RegistryAuth: d.registryAuthHeader(imageName),
+		Platform:     platform,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to pull image: %w", err)
 	}
@@ -299,9 +304,14 @@ func (d *DockerClient) PushImage(ctx context.Context, imageName string) error {
 	return err
 }
 
-// PullImageStream starts pulling an image and returns the progress stream reader
-func (d *DockerClient) PullImageStream(ctx context.Context, imageName string) (io.ReadCloser, error) {
-	out, err := d.cli.ImagePull(ctx, imageName, image.PullOptions{RegistryAuth: d.registryAuthHeader(imageName)})
+// PullImageStream starts pulling an image and returns the progress stream reader.
+// platform specifies the target platform (e.g., "linux/amd64", "linux/arm64").
+// Empty string means use default platform.
+func (d *DockerClient) PullImageStream(ctx context.Context, imageName, platform string) (io.ReadCloser, error) {
+	out, err := d.cli.ImagePull(ctx, imageName, image.PullOptions{
+		RegistryAuth: d.registryAuthHeader(imageName),
+		Platform:     platform,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to pull image: %w", err)
 	}
@@ -457,4 +467,146 @@ func (d *DockerClient) ExecContainerStatus(ctx context.Context, execID string) (
 		ExitCode: inspectResp.ExitCode,
 		Output:   fmt.Sprintf("Command finished with exit code: %d", inspectResp.ExitCode),
 	}, nil
+}
+
+// ExecContainerStart creates and starts an exec instance, returning the exec ID immediately
+// without waiting for completion. The caller should use ExecContainerAttachStream to read output.
+func (d *DockerClient) ExecContainerStart(ctx context.Context, containerID string, cmd []string, env []string) (string, error) {
+	execConfig := types.ExecConfig{
+		Cmd:          cmd,
+		AttachStdout: true,
+		AttachStderr: true,
+		Tty:          false,
+		Env:          env,
+	}
+
+	execID, err := d.cli.ContainerExecCreate(ctx, containerID, execConfig)
+	if err != nil {
+		return "", fmt.Errorf("failed to create exec: %w", err)
+	}
+
+	err = d.cli.ContainerExecStart(ctx, execID.ID, types.ExecStartCheck{})
+	if err != nil {
+		return "", fmt.Errorf("failed to start exec: %w", err)
+	}
+
+	return execID.ID, nil
+}
+
+// ExecContainerStream attaches to a running exec and streams output via a callback.
+// Blocks until the exec output stream ends (process exit or EOF).
+func (d *DockerClient) ExecContainerStream(ctx context.Context, execID string, onOutput func(string)) error {
+	resp, err := d.cli.ContainerExecAttach(ctx, execID, types.ExecStartCheck{
+		Tty: false,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to attach exec: %w", err)
+	}
+	defer resp.Close()
+
+	buf := make([]byte, 4096)
+	for {
+		n, err := resp.Reader.Read(buf)
+		if n > 0 {
+			onOutput(string(buf[:n]))
+		}
+		if err != nil {
+			return nil
+		}
+	}
+}
+
+// IsExecRunning checks if an exec instance is still running.
+func (d *DockerClient) IsExecRunning(ctx context.Context, execID string) (bool, error) {
+	inspectResp, err := d.cli.ContainerExecInspect(ctx, execID)
+	if err != nil {
+		return false, fmt.Errorf("failed to inspect exec: %w", err)
+	}
+	return inspectResp.Running, nil
+}
+
+// GetExecExitCode returns the exit code of a finished exec.
+func (d *DockerClient) GetExecExitCode(ctx context.Context, execID string) (int, error) {
+	inspectResp, err := d.cli.ContainerExecInspect(ctx, execID)
+	if err != nil {
+		return -1, fmt.Errorf("failed to inspect exec: %w", err)
+	}
+	return inspectResp.ExitCode, nil
+}
+
+// KillProcessInContainer kills processes matching the given pattern in a container.
+// Uses pkill -f to match the full command line. The pattern should be the original
+// command string of the process to kill.
+func (d *DockerClient) KillProcessInContainer(ctx context.Context, containerID, pattern string) error {
+	execConfig := types.ExecConfig{
+		Cmd:          []string{"pkill", "-f", pattern},
+		AttachStdout: true,
+		AttachStderr: true,
+		Tty:          false,
+	}
+
+	execID, err := d.cli.ContainerExecCreate(ctx, containerID, execConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create kill exec: %w", err)
+	}
+
+	err = d.cli.ContainerExecStart(ctx, execID.ID, types.ExecStartCheck{})
+	if err != nil {
+		return fmt.Errorf("failed to start kill exec: %w", err)
+	}
+
+	// Wait for kill to complete (brief polling)
+	for i := 0; i < 10; i++ {
+		inspectResp, err := d.cli.ContainerExecInspect(ctx, execID.ID)
+		if err != nil {
+			break
+		}
+		if !inspectResp.Running {
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return nil
+}
+
+// LoadImage loads a Docker image from a tar file and returns the loaded image name.
+func (d *DockerClient) LoadImage(ctx context.Context, tarPath string) (string, error) {
+	f, err := os.Open(tarPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to open tar file: %w", err)
+	}
+	defer f.Close()
+
+	resp, err := d.cli.ImageLoad(ctx, f, false)
+	if err != nil {
+		return "", fmt.Errorf("failed to load image: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Parse the response to find the loaded image name
+	var imageName string
+	dec := json.NewDecoder(resp.Body)
+	for {
+		var msg map[string]interface{}
+		if err := dec.Decode(&msg); err != nil {
+			if err == io.EOF {
+				break
+			}
+			break
+		}
+		if stream, ok := msg["stream"].(string); ok {
+			// "Loaded image: <name>\n" or "Loaded image ID: <id>\n"
+			if strings.HasPrefix(stream, "Loaded image: ") {
+				imageName = strings.TrimSpace(strings.TrimPrefix(stream, "Loaded image: "))
+			}
+			if strings.HasPrefix(stream, "Loaded image ID: ") {
+				imageName = strings.TrimSpace(strings.TrimPrefix(stream, "Loaded image ID: "))
+			}
+		}
+	}
+
+	if imageName == "" {
+		return "", fmt.Errorf("failed to determine loaded image name from response")
+	}
+	return imageName, nil
 }
